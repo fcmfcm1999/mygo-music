@@ -7,6 +7,7 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
+	"mygo-music/internal/lyrics"
 	"mygo-music/internal/music"
 	"mygo-music/internal/player"
 )
@@ -49,7 +50,7 @@ const (
 func newNotch(a *app) *notch {
 	n := &notch{a: a}
 	n.measure()
-	n.winW, n.winH = notchOpenW+60, 240
+	n.winW, n.winH = notchOpenW+60, 280
 	n.place()
 	n.win = mygo.NewWindow(mygo.WindowOptions{
 		Title:         Tf("%s Mini Player", mygo.App.Name()),
@@ -225,7 +226,7 @@ func (n *notch) target() (w, h float32) {
 	case n.open && tr == nil:
 		return notchIdleW, n.h0 + 72
 	case n.open:
-		return notchOpenW, n.h0 + 178
+		return notchOpenW, n.h0 + 218
 	case n.hello && tr != nil:
 		return notchHelloW, n.h0 + 58
 	case !n.real && !s.NotchVirtual:
@@ -406,6 +407,45 @@ func (n *notch) compact(c *ui.Context, tr *music.Track, shown float32) {
 		ui.Spacer(c)
 		n.levels(c, tr, 16, s*0.7, 4)
 	})
+	n.compactLyric(c)
+}
+
+// compactLyric keeps the current line visible between the cover and levels.
+func (n *notch) compactLyric(c *ui.Context) {
+	n.a.tickTimes(c)
+	lines, loaded := n.a.pl.Lyrics()
+	if !loaded || len(lines) == 0 {
+		return
+	}
+	pos := n.a.pl.Position()
+	idx := lyrics.Index(lines, pos)
+	if idx < 0 || idx >= len(lines) || pos >= lines[idx].End {
+		return
+	}
+	l := lines[idx]
+	span := ui.Span{Text: l.Text, Size: 10.5, Weight: 600, Color: white.Alpha(0.9)}
+	w, textH := c.MeasureText(0, span)
+	ui.Box(c).Absolute().Top(0).Left(48).Right(48).Height(n.h0).Draw(func(p *ui.Painter, r ui.Rect) {
+		p.Clip(r, 0, func() {
+			if w <= r.W {
+				p.RichText(r.X+(r.W-w)/2, r.Y+(r.H-textH)/2, 0, span)
+				return
+			}
+			const gap, pause = float32(28), 800 * time.Millisecond
+			distance := w + gap
+			travel := time.Duration(float64(distance) / 30 * float64(time.Second))
+			cycle := pause + travel
+			elapsed := time.Duration(p.Now().UnixNano()) % cycle
+			var x float32
+			if elapsed > pause {
+				x = float32(elapsed-pause) / float32(travel) * distance
+			}
+			p.AnimationFrameRate(30)
+			y := r.Y + (r.H-textH)/2
+			p.RichText(r.X-x, y, 0, span)
+			p.RichText(r.X-x+distance, y, 0, span)
+		})
+	})
 }
 
 // levels draws the music's levels in the cover's color.
@@ -461,6 +501,7 @@ func (n *notch) expanded(c *ui.Context, tr *music.Track, open, left float32) {
 			a.likeButton(c.Key("like"), tr, 17, white.Alpha(0.6))
 			n.levels(c, tr, 26, 22, 5)
 		})
+		n.lyric(c)
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, clock(pl.Position())).FontSize(10.5).FontFeatures("tnum").TextColor(white.Alpha(0.5)).Width(30)
 			a.scrubber(c.Key("notch-scrub"), &n.scrub, white.Alpha(0.18), white.Alpha(0.9), 14, ui.Color{}).Grow(1)
@@ -469,6 +510,27 @@ func (n *notch) expanded(c *ui.Context, tr *music.Track, open, left float32) {
 		ui.Box(c).Margin(-6, 0, 0, 0).Children(func() {
 			a.transport(c, white, white.Alpha(0.4), white, 20)
 		})
+	})
+}
+
+// lyric shows the line currently sung in the middle of the expanded notch.
+func (n *notch) lyric(c *ui.Context) {
+	lines, loaded := n.a.pl.Lyrics()
+	if !loaded {
+		return
+	}
+	pos := n.a.pl.Position()
+	idx := lyrics.Index(lines, pos)
+	if idx < 0 || idx >= len(lines) || pos >= lines[idx].End {
+		ui.Box(c).Height(32)
+		return
+	}
+	l := lines[idx]
+	ui.Column(c).Height(32).Justify(ui.Center).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, l.Text).FontSize(13).FontWeight(600).SingleLine().TextAlign(ui.Center).TextColor(white.Alpha(0.92))
+		if l.Translation != "" {
+			ui.Text(c, l.Translation).FontSize(10.5).SingleLine().TextAlign(ui.Center).TextColor(white.Alpha(0.55))
+		}
 	})
 }
 
