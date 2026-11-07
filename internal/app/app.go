@@ -309,6 +309,14 @@ func Run() error {
 	if !mygo.App.RequestSingleInstanceLock() {
 		return nil
 	}
+	// The display name may change while the listener's library and settings
+	// stay where earlier versions kept them.
+	if dir, err := mygo.App.Path(mygo.PathAppData); err == nil {
+		mygo.App.SetPath(mygo.PathUserData, filepath.Join(dir, "MyGo Music"))
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		mygo.App.SetPath(mygo.PathCache, filepath.Join(dir, "MyGo Music"))
+	}
 	a := &app{
 		signInOver:  new(atomic.Pointer[mygo.Window]),
 		settingText: map[string]*string{},

@@ -2,7 +2,7 @@
 // Bun, of the command running. The development app (`mygo dev`) opens links of a
 // scheme of its own, for the installed app to keep mygo-music:// links.
 export default ({ command }: { command: string }) => ({
-  name: "MyGo Music",
+  name: "FantasyMusic",
   identifier: "dev.egoist.music",
   slug: "mygo-music",
   version: "0.1.7",
