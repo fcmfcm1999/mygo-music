@@ -94,7 +94,7 @@ func TestLikeEpisode(t *testing.T) {
 }
 
 // An episode of a source that likes songs but not episodes has no heart, and
-// ⌘D leaves it be: NetEase's liked songs refuse episodes, so every like failed.
+// ⌘D leaves it be: a service's liked songs may refuse episodes, so every like failed.
 func TestNoLikeForEpisodeSourceCantLike(t *testing.T) {
 	a := newTestApp()
 	without(a, "likeEpisode")

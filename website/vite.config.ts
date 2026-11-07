@@ -44,6 +44,14 @@ export default defineConfig(async () => ({
         enabled: true,
         crawlLinks: true,
         failOnError: true,
+        // Pages are fetched from a local preview server, which now and then
+        // resets a connection on Cloudflare's builders (fetch failed:
+        // ECONNRESET). A reset page is fetched again rather than failing
+        // the build, and fewer pages are asked for at once: by default it's
+        // one per CPU, and the builder reports many.
+        concurrency: 4,
+        retryCount: 3,
+        retryDelay: 1000,
         // Links to a section of a page are that page.
         filter: ({ path }) => !path.includes('#'),
       },

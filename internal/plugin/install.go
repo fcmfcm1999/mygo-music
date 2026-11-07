@@ -2,18 +2,23 @@ package plugin
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"mygo-music/internal/local"
@@ -116,14 +121,84 @@ func cutPrefixFold(s, prefix string) (string, bool) {
 	return s, false
 }
 
-func githubGet(path string, out any) (status int, err error) {
-	req, err := http.NewRequest("GET", githubAPI+path, nil)
-	if err != nil {
-		return 0, err
+// githubToken is the listener's own token for GitHub, if they have one, which
+// GitHub's API is asked with: it allows 5,000 requests an hour with one, and 60
+// without, from all on the same network, and private repositories install too.
+// Tests replace it.
+var githubToken = sync.OnceValue(findGitHubToken)
+
+// tokenRefused is whether GitHub turned the token down, as it does one that's
+// expired or revoked, for the app to go on without it.
+var tokenRefused atomic.Bool
+
+// findGitHubToken looks for a token in GITHUB_TOKEN or GH_TOKEN, as GitHub's own
+// tools do, and then asks GitHub's CLI for the one it's signed in with.
+func findGitHubToken() string {
+	for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		if t := strings.TrimSpace(os.Getenv(name)); t != "" {
+			return t
+		}
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "mygo-music")
-	res, err := installClient.Do(req)
+	gh, err := exec.LookPath("gh")
+	if err != nil {
+		// An app opened from the Finder has a PATH without Homebrew's.
+		for _, path := range []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"} {
+			if _, err := os.Stat(path); err == nil {
+				gh = path
+				break
+			}
+		}
+	}
+	if gh == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gh, "auth", "token", "--hostname", "github.com")
+	hideConsole(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// withToken is whether GitHub's API is asked with the listener's token.
+func withToken() bool { return !tokenRefused.Load() && githubToken() != "" }
+
+// githubSend gets url, as the listener when it's GitHub's API and they have a
+// token, which goes nowhere else. One GitHub refuses is dropped, and the request
+// sent again without it.
+func githubSend(url, accept string) (*http.Response, error) {
+	token := ""
+	if strings.HasPrefix(url, githubAPI+"/") && withToken() {
+		token = githubToken()
+	}
+	for {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "mygo-music")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		res, err := installClient.Do(req)
+		if err != nil || token == "" || res.StatusCode != http.StatusUnauthorized {
+			return res, err
+		}
+		res.Body.Close()
+		log.Print("GitHub refused the token; going on without it")
+		tokenRefused.Store(true)
+		token = ""
+	}
+}
+
+func githubGet(path string, out any) (status int, err error) {
+	res, err := githubSend(githubAPI+path, "application/vnd.github+json")
 	if err != nil {
 		return 0, err
 	}
@@ -147,6 +222,7 @@ func Latest(repo string) (*Release, error) {
 		Assets []struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
+			API  string `json:"url"`
 		} `json:"assets"`
 	}
 	status, err := githubGet("/repos/"+repo+"/releases/latest", &rel)
@@ -161,6 +237,10 @@ func Latest(repo string) (*Release, error) {
 		url := rel.Zip
 		if at := pickAsset(names, runtime.GOOS, runtime.GOARCH); at >= 0 {
 			url = rel.Assets[at].URL
+			// A private repository's assets download from the API alone.
+			if withToken() && rel.Assets[at].API != "" {
+				url = rel.Assets[at].API
+			}
 		}
 		return &Release{Repo: repo, Version: rel.Tag, url: url}, nil
 	}
@@ -211,6 +291,12 @@ func Fetch(repo, dir string) (*Pending, error) {
 	if err != nil {
 		return nil, err
 	}
+	return FetchRelease(rel, dir)
+}
+
+// FetchRelease is Fetch of a release Latest found already, without asking GitHub
+// again what there is.
+func FetchRelease(rel *Release, dir string) (*Pending, error) {
 	return pending(dir, func(tmp string) (*Pending, error) { return fetchInto(rel, tmp) })
 }
 
@@ -366,12 +452,13 @@ func copyFile(from, to string, perm os.FileMode, limit int64) (int64, error) {
 }
 
 func download(url, path string) error {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
+	// An asset from the API comes as itself with this, and as its description
+	// without; a zipball refuses it.
+	accept := ""
+	if strings.Contains(url, "/releases/assets/") {
+		accept = "application/octet-stream"
 	}
-	req.Header.Set("User-Agent", "mygo-music")
-	res, err := installClient.Do(req)
+	res, err := githubSend(url, accept)
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,14 @@ func (a *app) view(c *ui.Context) {
 
 	a.shortcuts(c)
 
+	// Back to the front, after the listener may have changed their
+	// playlists elsewhere.
+	active := c.WindowActive()
+	if active && a.wasBehind {
+		a.freshen()
+	}
+	a.wasBehind = !active
+
 	if c.Vibrancy() {
 		c.Root().Background(ui.Transparent)
 	}
@@ -157,6 +165,8 @@ func (a *app) load(r route) {
 	case pageLiked:
 		if !lib.likedPaged.loaded {
 			a.loadLikedPage(lib)
+		} else {
+			a.freshenLiked(lib)
 		}
 	case pageSavedAlbums:
 		if !lib.savedAlbumsPaged.loaded {
@@ -478,11 +488,21 @@ func (a *app) freshenHome() {
 	}
 }
 
+// listsFresh is how long the listener's playlists and liked songs, as last
+// loaded, are taken to be what the source has. They change elsewhere too, in
+// its own apps and on its website: opened again after it, or as the window
+// comes back to the front, they are asked for anew.
+const listsFresh = 30 * time.Second
+
 // loadPlaylist loads a playlist's page, and plays it once it has, if thenPlay.
+// Loaded a while ago, it shows as it was while it's asked for anew.
 func (a *app) loadPlaylist(lib *library, id string, thenPlay bool) {
 	if pl := lib.playlists[id]; pl != nil {
 		if thenPlay {
 			a.pl.PlayQueue(pl.Tracks, firstPlayable(pl.Tracks))
+		}
+		if !lib.freshPl[id] && time.Since(lib.plAt[id]) > listsFresh {
+			a.freshenPlaylist(lib, id)
 		}
 		return
 	}
@@ -491,6 +511,7 @@ func (a *app) loadPlaylist(lib *library, id string, thenPlay bool) {
 	}
 	lib.loadingPl[id] = true
 	delete(lib.plErr, id)
+	at := time.Now()
 	go func() {
 		pl, err := answered(lib.src.Playlist(id))
 		a.post(func() {
@@ -499,12 +520,56 @@ func (a *app) loadPlaylist(lib *library, id string, thenPlay bool) {
 				lib.plErr[id] = a.problem(lib, err, T("Couldn't load this playlist"))
 				return
 			}
-			lib.playlists[id] = pl
+			lib.playlists[id], lib.plAt[id] = pl, at
 			if thenPlay {
 				a.pl.PlayQueue(pl.Tracks, firstPlayable(pl.Tracks))
 			}
 		})
 	}()
+}
+
+// freshenPlaylist asks for a loaded playlist anew, which shows as it was until
+// the answer takes its place. Failing, it stays as it was.
+func (a *app) freshenPlaylist(lib *library, id string) {
+	was := lib.playlists[id]
+	before := *was
+	lib.freshPl[id] = true
+	at := time.Now()
+	go func() {
+		pl, err := answered(lib.src.Playlist(id))
+		a.post(func() {
+			delete(lib.freshPl, id)
+			// Changed in the app meanwhile, its songs or name, or forgotten:
+			// what's there is newer than what was asked for.
+			if err != nil || lib.playlists[id] != was || !sameList(was.Tracks, before.Tracks) ||
+				was.Name != before.Name || was.Saved != before.Saved {
+				return
+			}
+			lib.playlists[id], lib.plAt[id] = pl, at
+		})
+	}()
+}
+
+// sameList reports whether x and y are one list, not two alike: the app's
+// changes to a playlist's songs make a new one.
+func sameList(x, y []music.Track) bool {
+	return len(x) == len(y) && (len(x) == 0 || &x[0] == &y[0])
+}
+
+// freshen asks anew for what the listener keeps of the active source, as
+// the window comes back to the front: their playlists, and the page showing
+// if it's one of them.
+func (a *app) freshen() {
+	lib := a.library
+	if lib == nil || !lib.started {
+		return
+	}
+	if time.Since(lib.mineAt) > listsFresh {
+		a.loadMine(lib)
+	}
+	if r := a.route; r.src == lib.id && (r.page == pagePlaylist || r.page == pageLiked) {
+		a.load(r)
+	}
 }
 
 func firstPlayable(tracks []music.Track) int {

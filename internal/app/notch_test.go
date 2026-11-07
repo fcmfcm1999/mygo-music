@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 // The notch, turned off, shows itself as the first song plays, and only
 // then; its button keeps it on.
 func TestNotchGreetsOnce(t *testing.T) {
+	macOnly(t)
 	a := newTestApp()
 	n := &notch{a: a, w0: 200, h0: 32, winW: notchOpenW + 60, winH: 240}
 	a.notch = n
@@ -57,6 +59,7 @@ func TestNotchGreetsOnce(t *testing.T) {
 // be clicked. It used to open the player, which hid the button, and leaving
 // brought it back only to open again as the pointer came back to it.
 func TestNotchGreetingKeptUnderPointer(t *testing.T) {
+	macOnly(t)
 	a := newTestApp()
 	n := &notch{a: a, real: true, w0: 185, h0: 32, winW: notchOpenW + 60, winH: 240}
 	a.notch = n
@@ -107,5 +110,14 @@ func TestFirstUseFrames(t *testing.T) {
 		tt.Advance(time.Duration(ms) * time.Millisecond)
 		tt.Frame()
 		saveFrame(t, dir, fmt.Sprintf("notch-hello-%d.png", ms), tt.Image())
+	}
+}
+
+// macOnly skips a test of the greeting, which only macOS shows: the notch
+// is a Mac's.
+func macOnly(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Skip("the notch greets only on macOS")
 	}
 }

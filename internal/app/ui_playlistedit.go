@@ -3,6 +3,7 @@ package app
 import (
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -30,10 +31,10 @@ type deleteDialog struct {
 }
 
 // editable returns the listener's playlist id if they may edit its songs
-// and name, or nil.
+// and name, or nil: not one the source keeps itself.
 func (a *app) editable(id string) *music.Playlist {
 	for i := range a.mine {
-		if a.mine[i].ID == id {
+		if a.mine[i].ID == id && !a.mine[i].Fixed {
 			return &a.mine[i]
 		}
 	}
@@ -49,7 +50,7 @@ func (a *app) isSaved(pl *music.Playlist) bool {
 // savable reports whether the listener may save playlist pl: anyone's but
 // their own, with a source that keeps saved playlists.
 func (a *app) savable(pl *music.Playlist) bool {
-	return a.can("savePlaylist") && !pl.Mine && a.editable(pl.ID) == nil
+	return a.can("savePlaylist") && !pl.Mine && !slices.ContainsFunc(a.mine, func(m music.Playlist) bool { return m.ID == pl.ID })
 }
 
 // toggleSaved saves playlist pl for the listener, or unsaves it, at once
@@ -115,6 +116,7 @@ func (a *app) loadMine(lib *library) {
 	if !lib.can("playlists") {
 		return
 	}
+	lib.mineAt = time.Now()
 	go func() {
 		lists, err := lib.src.Playlists()
 		a.post(func() {
@@ -359,7 +361,7 @@ func (a *app) playlistItems(m *ui.Menu, tr *music.Track, pid string) {
 			}
 			var to []*music.Playlist
 			for i := range lib.mine {
-				if pl := &lib.mine[i]; pl.ID != pid {
+				if pl := &lib.mine[i]; pl.ID != pid && !pl.Fixed {
 					to = append(to, pl)
 				}
 			}

@@ -36,6 +36,7 @@ var linkScheme = func() string {
 // These reach GitHub, and the disk; tests replace them.
 var (
 	fetchPlugin  = plugin.Fetch
+	fetchRelease = plugin.FetchRelease
 	latestPlugin = plugin.Latest
 	openPlugin   = plugin.Open
 )
@@ -93,7 +94,22 @@ type pluginInstaller struct {
 	pending      *plugin.Pending // one downloaded, for the listener to allow
 	updating     map[string]bool
 	updateErr    map[string]string // what went wrong updating a plugin, by ID
+	// checked is what checking a plugin for a new version came to, when the
+	// listener asked, by ID.
+	checked map[string]checkResult
+	// found is the new version checking found of a plugin, by ID, for updating
+	// to install without asking GitHub again; after the app opens again, it asks.
+	found map[string]*plugin.Release
 }
+
+// checkResult is what checking a plugin for a new version came to.
+type checkResult int
+
+const (
+	checking checkResult = iota + 1
+	upToDate
+	checkFailed
+)
 
 // askForRepo opens the dialog that asks for a repository to install from.
 func (a *app) askForRepo() {
@@ -172,7 +188,7 @@ func (a *app) installFromDisk(folder bool) {
 			a.post(func() {
 				in.busy = false
 				if err != nil {
-					in.err = err.Error()
+					in.err = installError(err)
 					return
 				}
 				in.pending = pending
@@ -185,6 +201,9 @@ func (a *app) installFromDisk(folder bool) {
 func installError(err error) string {
 	if errors.Is(err, plugin.ErrNoRepo) {
 		return T("There's no such public repository on GitHub")
+	}
+	if needs, ok := errors.AsType[*plugin.NeedsNewerApp](err); ok {
+		return Tf("%s needs MyGo Music %s or later. Update MyGo Music first.", needs.Plugin, needs.Version)
 	}
 	return err.Error()
 }
@@ -202,7 +221,7 @@ func (a *app) confirmInstall() {
 		a.post(func() {
 			in.busy = false
 			if err != nil {
-				in.err = err.Error()
+				in.err = installError(err)
 				return
 			}
 			in.repo = ""
@@ -237,6 +256,7 @@ func (a *app) pluginInstalled(id string) error {
 	delete(a.settings.PluginUpdates, id)
 	a.settings.save()
 	delete(in.updating, id)
+	delete(in.found, id)
 	p, err := plugin.Load(filepath.Join(pluginsDir(), id), userDataDir("plugin-data"))
 	if err != nil {
 		return err
@@ -282,6 +302,7 @@ func (a *app) removePlugin(lib *library) {
 		a.switchSource(a.libs[0].id)
 	}
 	delete(a.settings.PluginUpdates, lib.id)
+	delete(a.installer.found, lib.id)
 	a.settings.save()
 	go func() {
 		if err := p.Remove(trashItem); err != nil {
@@ -319,7 +340,7 @@ func (a *app) checkPluginUpdates() {
 	a.settings.PluginsChecked = time.Now()
 	a.settings.save()
 	go func() {
-		found := map[string]string{}
+		found, releases := map[string]string{}, map[string]*plugin.Release{}
 		for id, o := range origins {
 			rel, err := latestPlugin(o.Repo)
 			if err != nil {
@@ -327,12 +348,60 @@ func (a *app) checkPluginUpdates() {
 				continue
 			}
 			if plugin.IsNewer(rel.Version, o.Version) {
-				found[id] = rel.Version
+				found[id], releases[id] = rel.Version, rel
 			}
 		}
 		a.post(func() {
 			a.settings.PluginUpdates = found
+			a.installer.found = releases
 			a.settings.save()
+			a.redraw()
+		})
+	}()
+}
+
+// checkPluginUpdate checks one plugin for a new version now, as the listener
+// asks from its menu, whenever the daily check was. A new one shows its Update
+// button; none, or none to be had, is said in its row.
+func (a *app) checkPluginUpdate(lib *library) {
+	p := pluginOf(lib)
+	if p == nil || p.Origin() == nil {
+		return
+	}
+	in := &a.installer
+	if in.checked == nil {
+		in.checked = map[string]checkResult{}
+	}
+	id, o := lib.id, *p.Origin()
+	if in.checked[id] == checking {
+		return
+	}
+	in.checked[id] = checking
+	delete(in.updateErr, id)
+	go func() {
+		rel, err := latestPlugin(o.Repo)
+		a.post(func() {
+			switch {
+			case err != nil:
+				log.Printf("checking plugin %s: %v", id, err)
+				in.checked[id] = checkFailed
+			case plugin.IsNewer(rel.Version, o.Version):
+				delete(in.checked, id)
+				if a.settings.PluginUpdates == nil {
+					a.settings.PluginUpdates = map[string]string{}
+				}
+				a.settings.PluginUpdates[id] = rel.Version
+				if in.found == nil {
+					in.found = map[string]*plugin.Release{}
+				}
+				in.found[id] = rel
+				a.settings.save()
+			default:
+				in.checked[id] = upToDate
+				delete(a.settings.PluginUpdates, id)
+				delete(in.found, id)
+				a.settings.save()
+			}
 			a.redraw()
 		})
 	}()
@@ -360,8 +429,20 @@ func (a *app) updatePlugin(lib *library) {
 	delete(in.updateErr, lib.id)
 	id := lib.id
 	had := p.Permissions()
+	// The version the check found, which the Update button names, rather than
+	// asking GitHub again for what's there.
+	rel := in.found[id]
+	if rel != nil && rel.Version != a.settings.PluginUpdates[id] {
+		rel = nil
+	}
 	go func() {
-		pending, err := fetchPlugin(o.Repo, pluginsDir())
+		var pending *plugin.Pending
+		var err error
+		if rel != nil {
+			pending, err = fetchRelease(rel, pluginsDir())
+		} else {
+			pending, err = fetchPlugin(o.Repo, pluginsDir())
+		}
 		if err == nil && asksForMore(had, pending.Manifest.Permissions) {
 			a.post(func() {
 				delete(in.updating, id)
@@ -479,7 +560,7 @@ func (a *app) installDialog(c *ui.Context, p palette) {
 				ui.Text(c, T("Asks for no network")).FontSize(13).TextColor(p.muted)
 			}
 			if len(perms.Process) > 0 {
-				ui.Text(c, programsWarning(perms.Process)).FontSize(13).TextColor(p.accent).LineHeight(1.45)
+				ui.Text(c, programsWarning(perms.Process)).FontSize(13).TextColor(p.muted).LineHeight(1.45)
 			}
 			problem()
 			buttons(T("Install"), in.busy, Tf("Install %s", pending.Manifest.Name), a.confirmInstall)
@@ -509,17 +590,18 @@ func (a *app) installDialog(c *ui.Context, p palette) {
 	})
 }
 
-// pluginFrom says where a plugin came from: its repository, or this computer, as
-// one installed from a folder or dropped in.
-func pluginFrom(lib *library) string {
+// pluginFrom says where a plugin came from: its repository, with its address
+// on GitHub, or this computer, as one installed from a folder or dropped in,
+// with none.
+func pluginFrom(lib *library) (from, url string) {
 	plug := pluginOf(lib)
 	if plug == nil {
-		return ""
+		return "", ""
 	}
 	if o := plug.Origin(); o != nil {
-		return o.Repo
+		return o.Repo, "https://github.com/" + o.Repo
 	}
-	return T("From this computer")
+	return T("From this computer"), ""
 }
 
 // pluginUpdateButton installs the new version of a plugin from GitHub, when
@@ -544,10 +626,20 @@ func (a *app) pluginUpdateButton(c *ui.Context, lib *library) {
 	}
 }
 
-// pluginUpdateError says what went wrong updating a plugin, if anything did.
+// pluginUpdateError says what went wrong updating a plugin, if anything did,
+// or what checking it for a new version came to.
 func (a *app) pluginUpdateError(c *ui.Context, lib *library, p palette) {
 	if msg := a.installer.updateErr[lib.id]; msg != "" {
 		ui.Text(c, msg).FontSize(12).TextColor(p.accent).LineHeight(1.4)
+		return
+	}
+	switch a.installer.checked[lib.id] {
+	case checking:
+		ui.Text(c, T("Checking for updates…")).FontSize(12).TextColor(p.muted)
+	case upToDate:
+		ui.Text(c, T("Up to date")).FontSize(12).TextColor(p.muted)
+	case checkFailed:
+		ui.Text(c, T("Couldn't check for updates")).FontSize(12).TextColor(p.accent)
 	}
 }
 
@@ -560,6 +652,12 @@ func (a *app) pluginMenu(c *ui.Context, lib *library, p palette) {
 	}
 	more := iconButton(c.Key("plugin-more"), iconMore, 16, p.muted, Tf("More for %s", lib.name()))
 	more.Menu(func(m *ui.Menu) {
+		if plug.Origin() != nil {
+			busy := a.installer.checked[lib.id] == checking || a.installer.updating[lib.id]
+			if m.Item(T("Check for Updates")).Disabled(busy).Chosen() {
+				a.checkPluginUpdate(lib)
+			}
+		}
 		if m.Item(T("Show Folder")).Chosen() {
 			revealFolder(plug.Dir())
 		}

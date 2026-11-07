@@ -402,3 +402,44 @@ func TestPlaylistEditFrames(t *testing.T) {
 		a.deleting.open = false
 	}
 }
+
+// A playlist of the listener's that the source keeps itself, such as the
+// songs they liked, is listed as theirs, but offers no editing, no saving,
+// and isn't a playlist to add songs to.
+func TestFixedPlaylist(t *testing.T) {
+	a := editTestApp()
+	a.mine = append([]music.Playlist{{ID: "5", Name: "我喜欢的音乐", Mine: true, Fixed: true}}, a.mine...)
+	a.playlists["5"] = &music.Playlist{ID: "5", Name: "我喜欢的音乐", Tracks: []music.Track{
+		song("3", "晴天", "周杰伦"),
+	}}
+	if a.editable("5") != nil {
+		t.Error("the fixed playlist is editable")
+	}
+	if a.savable(a.playlists["5"]) {
+		t.Error("offered to save the listener's own playlist")
+	}
+	tt := ui.NewTester(a.view, 1200, 800)
+	tt.Frame()
+	if err := tt.RightClick("宝船"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem("Add to Playlist", "我喜欢的音乐"); err == nil {
+		t.Error("offered to add the song to the fixed playlist")
+	}
+	tt.Frame()
+	if err := tt.RightClick("我喜欢的音乐"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem("Delete Playlist…"); err == nil {
+		t.Error("the sidebar offered to delete the fixed playlist")
+	}
+	tt.Frame()
+	a.route = route{page: pagePlaylist, src: "fake", id: "5"}
+	tt.Frame()
+	if err := tt.RightClick("晴天"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem("Remove from Playlist"); err == nil {
+		t.Error("offered to take a song out of the fixed playlist")
+	}
+}

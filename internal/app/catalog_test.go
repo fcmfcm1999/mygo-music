@@ -390,6 +390,27 @@ func TestEpisodeOpensShow(t *testing.T) {
 	}
 }
 
+// Who publishes a show, on its page, opens the page the source has of them.
+func TestShowOpensPublisher(t *testing.T) {
+	a := newTestApp()
+	a.shows["5"] = &showData{
+		show: &music.Show{ID: "5", Name: "夜航", Publisher: "主播", PublisherPage: "user:7", EpisodeCount: 3},
+		page: paged{loaded: true},
+	}
+	a.open(route{page: pageShow, id: "5"})
+	tt := ui.NewTester(a.view, 1200, 800)
+	tt.Frame()
+	r, ok := tt.Find("主播")
+	if !ok {
+		t.Fatal("no publisher")
+	}
+	tt.ClickAt(r.X+4, r.Y+r.H/2)
+	tt.Frame()
+	if want := (route{page: pageBrowse, src: "fake", id: "user:7"}); a.route != want {
+		t.Fatalf("route %+v", a.route)
+	}
+}
+
 // The sidebar's Podcasts opens the shows the listener subscribes to, which
 // it asks of the source then.
 func TestPodcastsPageLoads(t *testing.T) {

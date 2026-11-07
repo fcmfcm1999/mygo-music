@@ -3,6 +3,7 @@
 //
 //	{
 //	  "id": "example", "name": "Example", "main": "index.js", "playback": "stream",
+//	  "minAppVersion": "0.1.8",
 //	  "permissions": {"network": ["api.example.com"], "process": ["bin/helper-*", "ffmpeg"]}
 //	}
 //
@@ -37,6 +38,7 @@ import (
 	"github.com/MoeForge/moejs/eventloop"
 	"github.com/MoeForge/moejs/webapi"
 
+	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
 )
 
@@ -123,8 +125,30 @@ func (ps Programs) Allows(dir, command string) bool {
 // Manifest is a plugin's plugin.json.
 type Manifest struct {
 	music.Info
-	Main        string      `json:"main,omitempty"`
-	Permissions Permissions `json:"permissions"`
+	Main string `json:"main,omitempty"`
+	// MinAppVersion is the oldest version of the app the plugin works with,
+	// such as 0.1.8. An older one won't install it, or load it.
+	MinAppVersion  string           `json:"minAppVersion,omitempty"`
+	Permissions    Permissions      `json:"permissions"`
+	RequestHeaders []RequestHeaders `json:"requestHeaders,omitempty"`
+}
+
+// appVersion is the app's version, which the app sets. With none, as when
+// it's built for development, any plugin loads.
+var appVersion string
+
+// SetAppVersion says which version of the app this is.
+func SetAppVersion(v string) { appVersion = v }
+
+// NeedsNewerApp is why a plugin doesn't load: it works with a newer version of
+// the app than this.
+type NeedsNewerApp struct {
+	Plugin  string // its name
+	Version string // the oldest version it works with
+}
+
+func (e *NeedsNewerApp) Error() string {
+	return fmt.Sprintf("%s needs MyGo Music %s or later", e.Plugin, e.Version)
 }
 
 // Plugin is a music.Source in JavaScript. It starts on first use, and again on
@@ -135,6 +159,12 @@ type Plugin struct {
 	data     string // the plugin's own data, and ours about it
 	mod      *moejs.Module
 	exports  map[string]bool
+	locales  map[string]map[string]string // by language, the English to what it is in it
+
+	// starting is held while the plugin starts, and by Close, so one start
+	// runs at a time and none outlives a Close. It isn't mu: the module's top
+	// level runs as it starts, and the host functions it calls take mu.
+	starting sync.Mutex
 
 	mu       sync.Mutex // guards what follows
 	settings map[string]string
@@ -174,6 +204,17 @@ func Load(dir, dataDir string) (*Plugin, error) {
 	if m.Main == "" {
 		m.Main = "index.js"
 	}
+	if m.MinAppVersion != "" {
+		if _, ok := versionNumbers(m.MinAppVersion); !ok {
+			return nil, fmt.Errorf("%s: minAppVersion isn't a version such as 0.1.8: %q", dir, m.MinAppVersion)
+		}
+		if _, ok := versionNumbers(appVersion); ok && IsNewer(m.MinAppVersion, appVersion) {
+			return nil, &NeedsNewerApp{Plugin: m.Name, Version: m.MinAppVersion}
+		}
+	}
+	if err := checkRequestHeaders(&m); err != nil {
+		return nil, fmt.Errorf("%s: %w", dir, err)
+	}
 	source, err := os.ReadFile(filepath.Join(dir, m.Main))
 	if err != nil {
 		return nil, err
@@ -198,10 +239,47 @@ func Load(dir, dataDir string) (*Plugin, error) {
 	for _, name := range mod.Exports() {
 		p.exports[name] = true
 	}
+	if p.locales, err = readLocales(dir); err != nil {
+		return nil, err
+	}
 	readJSON(filepath.Join(p.data, "settings.json"), &p.settings)
 	readJSON(filepath.Join(p.data, "storage.json"), &p.storage)
 	readJSON(filepath.Join(p.data, "granted.json"), &p.granted)
 	return p, nil
+}
+
+// readLocales reads the plugin's translations: for each language the app
+// speaks but English, locales/<language>.json, such as locales/zh-CN.json, of
+// the English text to what it is in that language, as the app's own are.
+func readLocales(dir string) (map[string]map[string]string, error) {
+	locales := map[string]map[string]string{}
+	for _, l := range i18n.Languages {
+		if l.Code == i18n.English {
+			continue
+		}
+		path := filepath.Join(dir, "locales", l.Code+".json")
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var texts map[string]string
+		if err := json.Unmarshal(b, &texts); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		locales[l.Code] = texts
+	}
+	return locales, nil
+}
+
+// t is the text in the listener's language, if the plugin translated it.
+func (p *Plugin) t(text string) string {
+	if tr := p.locales[i18n.Language()][text]; tr != "" {
+		return tr
+	}
+	return text
 }
 
 func readJSON(path string, into any) {
@@ -272,6 +350,8 @@ func (p *Plugin) Grant(on bool) error {
 
 // Close stops the plugin, and the programs it started.
 func (p *Plugin) Close() {
+	p.starting.Lock()
+	defer p.starting.Unlock()
 	p.mu.Lock()
 	v := p.vm
 	p.vm = nil
@@ -328,19 +408,33 @@ var helperScript = func() *moejs.Script {
 
 // running is the plugin's runtime, started if it isn't.
 func (p *Plugin) running() (*vm, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.vm != nil {
-		return p.vm, nil
+	if v := p.current(); v != nil {
+		return v, nil
 	}
+	p.starting.Lock()
+	defer p.starting.Unlock()
+	if v := p.current(); v != nil {
+		return v, nil
+	}
+	// Not under mu: the top level may read its storage or settings.
 	v, err := p.start()
 	if err != nil {
 		return nil, fmt.Errorf("starting plugin %s: %w", p.manifest.ID, err)
 	}
+	p.mu.Lock()
 	p.vm = v
+	p.mu.Unlock()
 	return v, nil
 }
 
+func (p *Plugin) current() *vm {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.vm
+}
+
+// start runs the plugin, its module's top level too. The caller holds
+// p.starting, and not p.mu, which the host functions take.
 func (p *Plugin) start() (*vm, error) {
 	// host.dataDir is there for the plugin to use, and for programs it starts.
 	if err := os.MkdirAll(p.data, 0o700); err != nil {
@@ -353,7 +447,10 @@ func (p *Plugin) start() (*vm, error) {
 	if err != nil {
 		return nil, err
 	}
-	api, err := webapi.Install(loop, p.webOptions())
+	p.mu.Lock()
+	web := p.webOptions()
+	p.mu.Unlock()
+	api, err := webapi.Install(loop, web)
 	if err != nil {
 		return nil, err
 	}
@@ -539,8 +636,24 @@ func (p *Plugin) drop(v *vm) {
 	go v.close()
 }
 
-// Info is what plugin.json says of the plugin.
-func (p *Plugin) Info() music.Info { return p.manifest.Info }
+// Info is what plugin.json says of the plugin, in the listener's language as
+// far as the plugin translated it: its name, settings and sidebar.
+func (p *Plugin) Info() music.Info {
+	info := p.manifest.Info
+	if len(p.locales[i18n.Language()]) == 0 {
+		return info
+	}
+	info.Name = p.t(info.Name)
+	info.Settings = slices.Clone(info.Settings)
+	for i, st := range info.Settings {
+		info.Settings[i].Label, info.Settings[i].Help = p.t(st.Label), p.t(st.Help)
+	}
+	info.Navigation = slices.Clone(info.Navigation)
+	for i, n := range info.Navigation {
+		info.Navigation[i].Title = p.t(n.Title)
+	}
+	return info
+}
 
 // Can reports whether the plugin exports the function. It's known from
 // compiling it, without running anything, so the views can ask at any time.

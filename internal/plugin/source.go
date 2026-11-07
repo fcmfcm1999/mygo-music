@@ -3,6 +3,8 @@ package plugin
 import (
 	"errors"
 	"log"
+	"net/url"
+	"strings"
 
 	"mygo-music/internal/music"
 )
@@ -283,6 +285,18 @@ func (p *Plugin) Stream(id, quality string) (*music.Stream, error) {
 	if err := p.call("stream", map[string]string{"id": id, "quality": quality}, &s); err != nil {
 		return nil, err
 	}
+	// The plugin's requestHeaders for audio go with it, under what the
+	// stream says itself.
+	if u, err := url.Parse(s.URL); err == nil {
+		for k, v := range p.HeadersFor(u, KindAudio) {
+			if s.Headers == nil {
+				s.Headers = map[string]string{}
+			}
+			if !hasHeader(s.Headers, k) {
+				s.Headers[k] = v
+			}
+		}
+	}
 	return &s, nil
 }
 
@@ -326,3 +340,13 @@ var (
 	_ music.Source   = (*Plugin)(nil)
 	_ music.Recorder = (*Plugin)(nil)
 )
+
+// hasHeader reports whether headers has name, in any case.
+func hasHeader(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}

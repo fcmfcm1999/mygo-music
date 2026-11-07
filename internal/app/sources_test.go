@@ -1417,3 +1417,131 @@ func TestUpdateAsksForMore(t *testing.T) {
 		t.Error("any program already covers one")
 	}
 }
+
+// Checking a plugin for updates from its menu asks GitHub even though the
+// daily check just did: with nothing new it's up to date, and a new version
+// shows its Update button.
+func TestCheckPluginUpdateNow(t *testing.T) {
+	latest := "v0.1.0"
+	was := latestPlugin
+	defer func() { latestPlugin = was }()
+	latestPlugin = func(repo string) (*plugin.Release, error) {
+		return &plugin.Release{Repo: repo, Version: latest}, nil
+	}
+	a := newTestApp()
+	ch := posts(a)
+	addFake(a, githubPlugin(t))
+	a.settings.PluginsChecked = time.Now()
+	a.settingsPage = "plugins"
+	tt := ui.NewTester(a.settingsView, 780, 1000)
+	tt.Frame()
+
+	check := func() {
+		t.Helper()
+		if err := tt.Click("More for GH"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tt.ChooseMenuItem("Check for Updates"); err != nil {
+			t.Fatalf("%v; the menu shows %q", err, tt.Menu())
+		}
+		runPost(t, ch)
+		tt.Frame()
+	}
+	check()
+	if a.installer.checked["gh"] != upToDate || len(a.settings.PluginUpdates) != 0 {
+		t.Errorf("checked %v, found %v", a.installer.checked, a.settings.PluginUpdates)
+	}
+	latest = "v0.2.0"
+	check()
+	if _, ok := tt.Find("Update to v0.2.0"); !ok {
+		t.Errorf("no update: %q", tt.Texts())
+	}
+	settled(tt)
+}
+
+// Updating a plugin installs the version its check found without asking GitHub
+// what's there again, as each ask counts against its limit; once the app has
+// opened again and it's forgotten what was found, it asks.
+func TestUpdatePluginReusesCheck(t *testing.T) {
+	asked := 0
+	wasLatest, wasFetch, wasRelease := latestPlugin, fetchPlugin, fetchRelease
+	defer func() { latestPlugin, fetchPlugin, fetchRelease = wasLatest, wasFetch, wasRelease }()
+	latestPlugin = func(repo string) (*plugin.Release, error) {
+		asked++
+		return &plugin.Release{Repo: repo, Version: "v0.2.0"}, nil
+	}
+	fetched := make(chan string, 1)
+	fetchRelease = func(rel *plugin.Release, dir string) (*plugin.Pending, error) {
+		fetched <- "release " + rel.Version
+		return nil, errors.New("offline")
+	}
+	fetchPlugin = func(repo, dir string) (*plugin.Pending, error) {
+		fetched <- "latest of " + repo
+		return nil, errors.New("offline")
+	}
+	a := newTestApp()
+	ch := posts(a)
+	addFake(a, githubPlugin(t))
+	a.settingsPage = "plugins"
+	tt := ui.NewTester(a.settingsView, 780, 1000)
+	tt.Frame()
+	if err := tt.Click("More for GH"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.ChooseMenuItem("Check for Updates"); err != nil {
+		t.Fatalf("%v; the menu shows %q", err, tt.Menu())
+	}
+	runPost(t, ch)
+	tt.Frame()
+
+	update := func() string {
+		t.Helper()
+		if err := tt.Click("Update to v0.2.0"); err != nil {
+			t.Fatalf("%v; shows %q", err, tt.Texts())
+		}
+		got := wait(t, fetched, "the download")
+		runPost(t, ch)
+		tt.Frame()
+		return got
+	}
+	if got := update(); got != "release v0.2.0" || asked != 1 {
+		t.Errorf("updating fetched the %s, asking GitHub %d times", got, asked)
+	}
+	a.installer.found = nil
+	if got := update(); got != "latest of o/gh" {
+		t.Errorf("after opening again, updating fetched the %s", got)
+	}
+	settled(tt)
+}
+
+// githubPlugin is a plugin installed from o/gh at v0.1.0.
+func githubPlugin(t *testing.T) *plugin.Plugin {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "gh")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(`{"id":"gh","name":"GH"}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "index.js"), []byte(""), 0o644)
+	os.WriteFile(filepath.Join(dir, ".origin.json"), []byte(`{"repo":"o/gh","version":"v0.1.0"}`), 0o644)
+	p, err := plugin.Load(dir, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Clicking where a plugin came from in its settings opens its repository on
+// GitHub.
+func TestPluginRepoOpensGitHub(t *testing.T) {
+	a := newTestApp()
+	addFake(a, githubPlugin(t))
+	a.settingsPage = "plugins"
+	tt := ui.NewTester(a.settingsView, 780, 1000)
+	tt.Frame()
+	if err := tt.Click("o/gh"); err != nil {
+		t.Fatal(err)
+	}
+	if got := tt.OpenedURLs(); len(got) != 1 || got[0] != "https://github.com/o/gh" {
+		t.Errorf("opened %q", got)
+	}
+	settled(tt)
+}

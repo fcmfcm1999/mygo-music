@@ -72,6 +72,18 @@ func T(text string) string {
 	return text
 }
 
+// TC is T of a text that reads differently by what it's about, as Save is one
+// word for keeping a name and another for adding an album to the library. The
+// catalog has it as "text|context", and English reads the text.
+func TC(text, context string) string {
+	if Language() == Chinese {
+		if zh, ok := zhCN[text+"|"+context]; ok {
+			return zh
+		}
+	}
+	return text
+}
+
 // Tf is T of a format, formatted. Its arguments must stay in the order the
 // English has them, or the translation numbers them, as %[2]d.
 func Tf(format string, args ...any) string {

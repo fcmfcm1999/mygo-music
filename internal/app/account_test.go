@@ -50,6 +50,47 @@ func TestAccountMenu(t *testing.T) {
 	}
 }
 
+// My Page in the account menu opens the listener's own page at the source,
+// and loads it anew each time, as what they follow changes on other pages.
+func TestAccountMyPage(t *testing.T) {
+	a := newTestApp()
+	ch := posts(a)
+	a.account = &music.Account{ID: "1", Name: "小明", Page: "user:1"}
+	asked := make(chan string, 4)
+	fake(a).browse = func(page string) (*music.Browse, error) {
+		asked <- page
+		return &music.Browse{Title: "小明", ImageURL: "https://example.com/a.jpg", Description: "3 关注 · 5 粉丝\n你好",
+			Sections: []music.Section{{Title: "创建的歌单", Empty: "暂无公开歌单"}}}, nil
+	}
+	tt := ui.NewTester(a.view, 1000, 700)
+	tt.Frame()
+
+	tt.Click("小明")
+	tt.Frame()
+	if !tt.Focused("My Page") {
+		t.Fatal("My Page isn't first in the menu")
+	}
+	if err := tt.Click("My Page"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if want := (route{page: pageBrowse, id: "user:1", src: "fake"}); a.route != want || a.accountOpen {
+		t.Fatalf("route %+v, menu open %v", a.route, a.accountOpen)
+	}
+	if got := wait(t, asked, "the page"); got != "user:1" {
+		t.Fatalf("asked for %q", got)
+	}
+	runPost(t, ch)
+	tt.Frame()
+
+	a.open(route{page: pageHome})
+	tt.Frame()
+	tt.Click("小明")
+	tt.Frame()
+	tt.Click("My Page")
+	wait(t, asked, "the page again")
+}
+
 // With MM_FRAMES set, saves the foot of the sidebar with the account menu
 // open, light and dark.
 func TestAccountMenuFrames(t *testing.T) {

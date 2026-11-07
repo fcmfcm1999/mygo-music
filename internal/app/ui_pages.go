@@ -134,9 +134,9 @@ func (a *app) emptyHome(c *ui.Context) {
 			ui.Text(c, T("Looking for music…")).FontSize(22).FontWeight(700).LetterSpacing(-0.3)
 			ui.Text(c, T("Songs will show here as they're found.")).FontSize(13.5).TextColor(p.muted).TextAlign(ui.Center)
 		case lib.id == local.ID:
-			title, sub := T("Add a music folder"), T("Choose where your music lives, and it will all be here: MP3, FLAC and Ogg files, with their tags, covers and lyrics.")
+			title, sub := T("Add a music folder"), T("Choose where your music lives, and it will all be here: MP3, FLAC, Ogg, WAV and M4A files, with their tags, covers and lyrics.")
 			if a.local != nil && len(a.local.Folders()) > 0 {
-				title, sub = T("No music found"), T("There are no MP3 or FLAC files in the folders you chose. Try another.")
+				title, sub = T("No music found"), T("There are no music files in the folders you chose. Try another.")
 			}
 			ui.Text(c, title).FontSize(22).FontWeight(700).LetterSpacing(-0.3)
 			ui.Text(c, sub).FontSize(13.5).TextColor(p.muted).TextAlign(ui.Center).MaxWidth(420).LineHeight(1.45)
@@ -294,7 +294,7 @@ func (a *app) playlistHeader(c *ui.Context, pl *music.Playlist) {
 			ui.Row(c).Gap(10).Margin(10, 0, 0, 0).Children(func() {
 				a.playButtons(c, pl.Tracks)
 				if a.savable(pl) {
-					icon, label := iconPlus, T("Save")
+					icon, label := iconPlus, TC("Save", "library")
 					if a.isSaved(pl) {
 						icon, label = iconCheck, T("Saved")
 					}
@@ -373,6 +373,9 @@ func (a *app) loadLikedPage(lib *library) {
 	}
 	lib.likedPaged.loading, lib.likedPaged.err = true, ""
 	offset := len(lib.likedList)
+	if offset == 0 {
+		lib.likedAt = time.Now()
+	}
 	go func() {
 		page, err := answered(lib.src.Liked(offset))
 		a.post(func() {
@@ -388,6 +391,44 @@ func (a *app) loadLikedPage(lib *library) {
 			}
 			for i := range page.Tracks {
 				lib.liked[page.Tracks[i].ID] = true
+			}
+		})
+	}()
+}
+
+// freshenLiked asks for the first page of the liked songs anew, a while after
+// it was: it takes the place of what's listed, which shows until it comes.
+// Songs listed before and not now are asked about again as their hearts show.
+func (a *app) freshenLiked(lib *library) {
+	if lib.likedFresh || lib.likedPaged.loading || time.Since(lib.likedAt) <= listsFresh {
+		return
+	}
+	lib.likedFresh, lib.likedAt = true, time.Now()
+	was := lib.likedList
+	who := lib.listener()
+	go func() {
+		page, err := answered(lib.src.Liked(0))
+		a.post(func() {
+			lib.likedFresh = false
+			// Liked or not in the app meanwhile, or more of it loaded, or
+			// forgotten: what's there is newer than what was asked for.
+			if err != nil || !sameList(lib.likedList, was) || lib.likedPaged.loading || lib.listener() != who {
+				return
+			}
+			lib.likedList = page.Tracks
+			lib.likedPaged.more = page.More && len(page.Tracks) > 0
+			if lib.liked == nil {
+				lib.liked = map[string]bool{}
+			}
+			now := make(map[string]bool, len(page.Tracks))
+			for i := range page.Tracks {
+				now[page.Tracks[i].ID] = true
+				lib.liked[page.Tracks[i].ID] = true
+			}
+			for i := range was {
+				if !now[was[i].ID] {
+					delete(lib.liked, was[i].ID)
+				}
 			}
 		})
 	}()

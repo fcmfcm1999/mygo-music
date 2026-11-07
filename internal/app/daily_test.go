@@ -104,3 +104,23 @@ func TestFeatureCardKeepsItsSectionOff(t *testing.T) {
 		t.Errorf("the playlists are %.1f under the card", gap)
 	}
 }
+
+// The page the feature card opens is headed by the section's pageTitle, if
+// it has one, and its subtitle follows the count of songs.
+func TestSectionPageHeading(t *testing.T) {
+	a := featureApp("")
+	a.home.Sections[0].PageTitle = "Daily Song Picks"
+	a.home.Sections[0].Subtitle = "New every day"
+	tt := ui.NewTester(a.view, 1200, 800)
+	tt.Frame()
+	if err := tt.Click("For You"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if _, ok := tt.Find("Daily Song Picks"); !ok {
+		t.Error("the page isn't headed by its pageTitle")
+	}
+	if _, ok := tt.Find("3 songs · New every day"); !ok {
+		t.Error("the subtitle doesn't follow the count")
+	}
+}

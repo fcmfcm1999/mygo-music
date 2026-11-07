@@ -1,9 +1,10 @@
 // Package local is the built-in source of music files on disk: the folders the
-// listener chose, scanned for .mp3, .flac and .ogg. What it lists is held in memory
-// and swapped whole as a scan goes on, so asking never waits for one. What it
-// keeps is in its data directory: library.json is the listener's own (folders,
-// likes, playlists, what was played), index.json only saves reading the tags
-// of files again, and covers/ holds the pictures found inside files.
+// listener chose, scanned for .mp3, .flac, .ogg, .wav, .m4a and .aac. What it
+// lists is held in memory and swapped whole as a scan goes on, so asking never
+// waits for one. What it keeps is in its data directory: library.json is the
+// listener's own (folders, likes, playlists, what was played), index.json only
+// saves reading the tags of files again, and covers/ holds the pictures found
+// inside files.
 package local
 
 import (
@@ -549,7 +550,11 @@ func (s *Source) Lyrics(id string) (*music.Lyrics, error) {
 		return &music.Lyrics{}, nil
 	}
 	defer f.Close()
-	if t := readTags(f, fileType(f, it.Path)); lrcTime.MatchString(t.lyrics) {
+	var size int64
+	if info, err := f.Stat(); err == nil {
+		size = info.Size()
+	}
+	if t := readTags(f, fileType(f, it.Path), size); lrcTime.MatchString(t.lyrics) {
 		return &music.Lyrics{LRC: t.lyrics}, nil
 	}
 	return &music.Lyrics{}, nil
@@ -578,8 +583,13 @@ func (s *Source) Stream(id, quality string) (*music.Stream, error) {
 		Gain:    it.Gain,
 		Peak:    it.Peak,
 	}
-	if st.Type == "flac" {
+	switch st.Type {
+	case "flac", "wav":
 		st.Quality = "lossless"
+	case "m4a":
+		if t, ok := m4aTrack(f, info.Size()); ok && lossless(t) {
+			st.Quality = "lossless"
+		}
 	}
 	return st, nil
 }

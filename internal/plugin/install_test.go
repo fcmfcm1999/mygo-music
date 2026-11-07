@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -45,19 +46,31 @@ func makeZip(t *testing.T, files ...zipped) []byte {
 }
 
 // github is a GitHub with one repository: with a release of tag, or with commits
-// alone if tag is empty, serving archive.
+// alone if tag is empty, serving archive. token is the listener's, and refuse
+// answers any request with one as GitHub does one that's expired.
 type github struct {
 	tag, sha string
 	assets   []string
 	archive  []byte
 	notFound bool
+	token    string
+	refuse   bool
+	got      []request // what was asked, in order
 }
+
+type request struct{ path, auth, accept string }
 
 func (g *github) start(t *testing.T) {
 	t.Helper()
+	var mu sync.Mutex
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		g.got = append(g.got, request{r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Accept")})
+		mu.Unlock()
 		switch {
+		case g.refuse && r.Header.Get("Authorization") != "":
+			w.WriteHeader(http.StatusUnauthorized)
 		case g.notFound:
 			http.NotFound(w, r)
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
@@ -68,10 +81,11 @@ func (g *github) start(t *testing.T) {
 			type asset struct {
 				Name string `json:"name"`
 				URL  string `json:"browser_download_url"`
+				API  string `json:"url"`
 			}
 			assets := []asset{}
-			for _, a := range g.assets {
-				assets = append(assets, asset{a, srv.URL + "/asset/" + a})
+			for i, a := range g.assets {
+				assets = append(assets, asset{a, srv.URL + "/asset/" + a, fmt.Sprintf("%s/repos/owner/repo/releases/assets/%d", srv.URL, i)})
 			}
 			json.NewEncoder(w).Encode(map[string]any{"tag_name": g.tag, "zipball_url": srv.URL + "/zip", "assets": assets})
 		case strings.HasSuffix(r.URL.Path, "/commits/HEAD"):
@@ -81,9 +95,14 @@ func (g *github) start(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	was := githubAPI
+	was, wasToken := githubAPI, githubToken
 	githubAPI = srv.URL
-	t.Cleanup(func() { githubAPI = was })
+	githubToken = func() string { return g.token }
+	tokenRefused.Store(false)
+	t.Cleanup(func() {
+		githubAPI, githubToken = was, wasToken
+		tokenRefused.Store(false)
+	})
 }
 
 const goodManifest = `{"id":"good","name":"Good","version":"1.0.0","permissions":{"network":["api.example.com"]}}`
@@ -270,6 +289,59 @@ func TestNoSuchRepo(t *testing.T) {
 	g.start(t)
 	if _, err := Fetch("owner/repo", t.TempDir()); err != ErrNoRepo {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// With the listener's token, GitHub's API is asked as them, and a release's
+// asset downloads from the API, as a private repository's has to, as itself
+// rather than its description; without one, nothing carries a token and the
+// asset downloads from its page.
+func TestInstallWithToken(t *testing.T) {
+	zipName := "plugin-" + runtime.GOOS + "-" + runtime.GOARCH + ".zip"
+	for _, token := range []string{"secret", ""} {
+		g := &github{tag: "v1", assets: []string{zipName}, archive: goodArchive(t, ""), token: token}
+		g.start(t)
+		p, err := Fetch("owner/repo", t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Discard()
+		want := ""
+		if token != "" {
+			want = "Bearer " + token
+		}
+		for _, r := range g.got {
+			if r.auth != want {
+				t.Errorf("token %q: %s sent %q", token, r.path, r.auth)
+			}
+		}
+		last := g.got[len(g.got)-1]
+		if token != "" && (last.path != "/repos/owner/repo/releases/assets/0" || last.accept != "application/octet-stream") {
+			t.Errorf("with a token, downloaded %+v", last)
+		}
+		if token == "" && last.path != "/asset/"+zipName {
+			t.Errorf("without a token, downloaded %+v", last)
+		}
+	}
+}
+
+// A token GitHub refuses, as an expired one, is dropped: what was asked with it
+// is asked again without, and nothing after carries it.
+func TestRefusedToken(t *testing.T) {
+	g := &github{sha: "0123456789abcdef0123", archive: goodArchive(t, ""), token: "expired", refuse: true}
+	g.start(t)
+	p, err := Fetch("owner/repo", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Discard()
+	if g.got[0].auth == "" {
+		t.Fatal("never tried the token")
+	}
+	for _, r := range g.got[1:] {
+		if r.auth != "" {
+			t.Errorf("%s sent the token after it was refused", r.path)
+		}
 	}
 }
 

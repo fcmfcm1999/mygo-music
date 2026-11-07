@@ -134,16 +134,13 @@ func TestFLACMetadataLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := decodeAll(t, b)
-	start, err := flacDataStart(downloaded(b))
-	if err != nil {
-		t.Fatal(err)
-	}
 	// The last block's header is no longer the last: a padding block of 6
 	// bytes follows it.
 	off := int64(4)
 	for b[off]&0x80 == 0 {
 		off += 4 + (int64(b[off+1])<<16 | int64(b[off+2])<<8 | int64(b[off+3]))
 	}
+	start := off + 4 + (int64(b[off+1])<<16 | int64(b[off+2])<<8 | int64(b[off+3]))
 	padded := append([]byte(nil), b[:start]...)
 	padded[off] &^= 0x80
 	padded = append(padded, 0x81, 0, 0, 6, 0, 0, 0, 0, 0, 0)
@@ -517,5 +514,52 @@ func TestOggComingIn(t *testing.T) {
 	}
 	if _, err := s.Read(buf); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The spectrum keeps the last seconds decoded, however long the audio: hours
+// in, it measures what plays, forgets what played long ago, and measures again
+// after a seek back.
+func TestSpectrumKeepsRecentChunks(t *testing.T) {
+	const rate = 44100
+	s := newSpectrum(rate)
+	if keep := time.Duration(len(s.ring)) * fftSize * time.Second / rate; keep < spectrumKeep || keep > spectrumKeep+time.Second {
+		t.Fatalf("keeps %v of chunks, want about %v", keep, spectrumKeep)
+	}
+	tone := func(at int64, frames int) {
+		stereo := make([]float32, frames*2)
+		for i := range frames {
+			v := float32(0.5 * math.Sin(2*math.Pi*440*float64(at+int64(i))/rate))
+			stereo[2*i], stereo[2*i+1] = v, v
+		}
+		s.feed(at, stereo)
+	}
+	measured := func(at time.Duration) bool {
+		_, ok := s.at(int64(at.Seconds() * rate))
+		return ok
+	}
+
+	// Ten hours in, as an audiobook seeks to where it was left.
+	start := int64(10 * 60 * 60 * rate)
+	tone(start, 30*rate)
+	end := time.Duration(start/rate)*time.Second + 30*time.Second
+	if !measured(end - time.Second) {
+		t.Error("a second before the end decoded isn't measured")
+	}
+	if measured(end - 25*time.Second) {
+		t.Error("25 seconds before the end decoded is still kept")
+	}
+	if measured(end + time.Second) {
+		t.Error("what isn't decoded yet is measured")
+	}
+	if !measured(end - spectrumKeep + time.Second) {
+		t.Errorf("%v before the end decoded isn't kept", spectrumKeep-time.Second)
+	}
+
+	// A seek back decodes, and measures, again.
+	back := time.Duration(start/rate)*time.Second + 2*time.Second
+	tone(int64(back.Seconds()*rate), rate)
+	if !measured(back + 500*time.Millisecond) {
+		t.Error("what plays after a seek back isn't measured")
 	}
 }

@@ -49,7 +49,7 @@ func openOggStream(dl *download, durationMs int64) (*oggStream, error) {
 	if s.frames <= 0 {
 		s.frames = durationMs * int64(s.r.SampleRate()) / 1000
 	}
-	s.spec = newSpectrum(s.r.SampleRate(), s.frames)
+	s.spec = newSpectrum(s.r.SampleRate())
 	return s, nil
 }
 

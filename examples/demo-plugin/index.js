@@ -86,24 +86,27 @@ export function setSetting({ key, value }) {
   console.log(`setting ${key} changed to ${value}`);
 }
 
-// Home and pages of the plugin's own.
+// Home and pages of the plugin's own. What they say is in the listener's
+// language, from locales/zh-CN.json, through host.t.
+const t = host.t;
+
 export function home() {
   return {
-    title: host.setting("greeting") || "Welcome",
+    title: host.setting("greeting") || t("Welcome"),
     sections: [
-      { title: "Picked for you", tracks, morePage: "discover" },
-      { title: "Albums", albums: [album] },
-      { title: "Listen", shows: [show], stations: [station] },
-      { title: "Explore", links: [{ title: "Discover", subtitle: "A page of the plugin's own", page: "discover" }] },
+      { title: t("Picked for you"), tracks, morePage: "discover" },
+      { title: t("Albums"), albums: [album] },
+      { title: t("Listen"), shows: [show], stations: [station] },
+      { title: t("Explore"), links: [{ title: t("Discover"), subtitle: t("A page of the plugin's own"), page: "discover" }] },
     ],
   };
 }
 export function browse({ page }) {
   if (page !== "discover") throw fail("unavailable", "no such page");
   return {
-    title: "Discover",
-    subtitle: "Anything a plugin wants to show",
-    sections: [{ title: "Artists", artists: [artist] }, { title: "Everything", tracks }],
+    title: t("Discover"),
+    subtitle: t("Anything a plugin wants to show"),
+    sections: [{ title: t("Artists"), artists: [artist] }, { title: t("Everything"), tracks }],
   };
 }
 

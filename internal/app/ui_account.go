@@ -332,7 +332,8 @@ func (a *app) accountRow(c *ui.Context) {
 }
 
 // accountMenu drops up from the account row, as wide as it, in the colors
-// of the volume popover: the settings, then signing out.
+// of the volume popover: the listener's own page, if the source has one, and
+// the settings, then signing out.
 func (a *app) accountMenu(c *ui.Context, row ui.Element) {
 	pop := popoverColors(a.pal.dark)
 	ui.PopoverBase(c.Key("account-menu"), row, &a.accountOpen, func(panel ui.Element) {
@@ -346,7 +347,19 @@ func (a *app) accountMenu(c *ui.Context, row ui.Element) {
 		if runtime.GOOS == "darwin" {
 			shortcut = "⌘,"
 		}
-		if a.menuItem(c, iconSettings, T("Settings…"), shortcut).AutoFocus().Clicked() {
+		first := true
+		if acc := a.library.account; acc != nil && acc.Page != "" {
+			first = false
+			if a.menuItem(c, iconUser, T("My Page"), "").AutoFocus().Clicked() {
+				a.accountOpen = false
+				a.openMyPage(a.library)
+			}
+		}
+		settings := a.menuItem(c, iconSettings, T("Settings…"), shortcut)
+		if first {
+			settings.AutoFocus()
+		}
+		if settings.Clicked() {
 			a.accountOpen = false
 			a.openSettings()
 		}
@@ -356,6 +369,14 @@ func (a *app) accountMenu(c *ui.Context, row ui.Element) {
 			a.signOut(a.library)
 		}
 	})
+}
+
+// openMyPage opens the listener's own page at lib, loaded anew each time: they
+// follow and save on other pages, and it keeps up. What it had shows meanwhile.
+func (a *app) openMyPage(lib *library) {
+	r := route{page: pageBrowse, id: lib.account.Page, src: lib.id}
+	a.open(r)
+	a.loadBrowse(lib, r.id, true)
 }
 
 // menuItem is an item of a dropdown: an icon, its label, and the shortcut
@@ -437,6 +458,7 @@ func (a *app) myPlaylists(c *ui.Context, title string, lists []music.Playlist, m
 			ui.Text(c, pl.Name).FontSize(13).SingleLine().Shrink(1).MinWidth(0)
 		})
 		switch {
+		case mine && pl.Fixed:
 		case mine && (a.can("renamePlaylist") || a.can("deletePlaylist")):
 			b.ContextMenu(func(m *ui.Menu) { a.playlistMenu(m, pl) })
 		case !mine && a.can("savePlaylist"):

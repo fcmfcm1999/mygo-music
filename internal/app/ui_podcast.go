@@ -143,14 +143,22 @@ func (a *app) showPage(c *ui.Context) {
 			ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
 				ui.Text(c, T("Podcast")).FontSize(12).FontWeight(600).TextColor(p.accent)
 				ui.Text(c, show.Name).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
-				var meta []string
-				if show.Publisher != "" {
-					meta = append(meta, show.Publisher)
-				}
-				if n := show.EpisodeCount; n > 0 {
-					meta = append(meta, episodeCount(n))
-				}
-				ui.Text(c, strings.Join(meta, " · ")).FontSize(13).TextColor(p.muted)
+				// Who publishes it opens their page, if the source has one.
+				ui.RichText(c).FontSize(13).TextColor(p.muted).Children(func() {
+					if show.Publisher != "" {
+						if show.PublisherPage != "" {
+							a.link(c.Key("publisher"), show.Publisher, p.muted, p.text, route{page: pageBrowse, id: show.PublisherPage})
+						} else {
+							ui.Text(c, show.Publisher)
+						}
+						if show.EpisodeCount > 0 {
+							ui.Text(c, " · ")
+						}
+					}
+					if n := show.EpisodeCount; n > 0 {
+						ui.Text(c, episodeCount(n))
+					}
+				})
 				if desc := strings.TrimSpace(show.Description); desc != "" {
 					ui.Text(c, strings.ReplaceAll(desc, "\n", " ")).FontSize(12.5).TextColor(p.muted).MaxLines(2).LineHeight(1.45).Margin(2, 0, 0, 0)
 				}

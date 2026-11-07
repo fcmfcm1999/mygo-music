@@ -29,7 +29,13 @@ const (
 // header of the address the plugin asked for once the cookies it named are
 // all there, and closes the window. Closing it first is giving up.
 func (a *app) webSignIn(o plugin.WebSignIn) (string, error) {
-	if !mygo.WebViewAvailable() {
+	// Asked on the main thread: on Linux the first asking loads WebKitGTK and
+	// makes its default web context, and WebKit then takes the thread that did
+	// for its main one. Asked from here, the window made on the real main
+	// thread next aborted the app.
+	var available bool
+	mygo.RunOnMain(func() { available = mygo.WebViewAvailable() })
+	if !available {
 		return "", errors.New(T("This computer can't show the page to sign in on"))
 	}
 	session := mygo.NewEphemeralSession()

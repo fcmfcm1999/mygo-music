@@ -110,6 +110,33 @@ func TestSeeAllOpensBrowsePage(t *testing.T) {
 	}
 }
 
+// A page a source made up, opened again a while after it loaded, is asked
+// for anew, showing as it was until the answer comes. It was kept until the
+// app restarted, so a page of songs played lately never caught up.
+func TestBrowsePageFreshensWhenOpenedLater(t *testing.T) {
+	a, ch, asked := browseApp()
+	a.home = &music.Browse{Sections: []music.Section{{Title: "New Albums", Albums: []music.Album{{ID: "8", Name: "迷跡波"}}, MorePage: "albums"}}}
+	tt := ui.NewTester(a.view, 1200, 800)
+	tt.Frame()
+	if err := tt.Click("See All"); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, asked, "the page")
+	runPost(t, ch)
+	tt.Key(0, ui.KeyBack)
+	tt.Frame()
+	a.library.browses["albums"].at = time.Now().Add(-listsFresh - time.Second)
+	tt.Key(0, ui.KeyForward)
+	tt.Frame()
+	if page := wait(t, asked, "the page again"); page != "albums" {
+		t.Fatalf("asked for %q", page)
+	}
+	if _, ok := tt.Find("Page albums"); !ok {
+		t.Errorf("showed %q while asking again", tt.Texts())
+	}
+	runPost(t, ch)
+}
+
 // A section's Link opens the page it names, on a page that a link led to too,
 // and a track listed on such a page plays from there.
 func TestLinkOpensBrowsePage(t *testing.T) {

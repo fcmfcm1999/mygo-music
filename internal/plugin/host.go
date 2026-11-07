@@ -25,6 +25,7 @@ import (
 	"github.com/MoeForge/moejs"
 	"github.com/MoeForge/moejs/webapi"
 
+	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
 )
 
@@ -94,6 +95,16 @@ func (p *Plugin) installHost(v *vm) error {
 			"set":    moejs.NativeFunc(p.storageSet(v)),
 			"remove": moejs.NativeFunc(p.storageRemove),
 		},
+		// language answers the listener's, as the app speaks it: en or zh-CN.
+		// It changes as they change it, without the plugin starting over.
+		"language": moejs.NativeFunc(func(*moejs.Realm, moejs.Value, []moejs.Value) (moejs.Value, error) {
+			return moejs.String(i18n.Language()), nil
+		}),
+		// t answers the text in the listener's language, from the plugin's
+		// locales, or as it is when it has none for it.
+		"t": moejs.NativeFunc(func(_ *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+			return moejs.String(p.t(moejs.Arg(args, 0).String())), nil
+		}),
 		"setting": moejs.NativeFunc(func(_ *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
 			return moejs.String(p.Setting(moejs.Arg(args, 0).String())), nil
 		}),
@@ -346,6 +357,7 @@ func (p *Plugin) spawn(v *vm) native {
 		}
 		cmd := exec.Command(command, cmdArgs...)
 		cmd.Dir = p.dir
+		hideConsole(cmd)
 		stderr := &tailWriter{to: logWriter{p.manifest.ID}}
 		cmd.Stderr = stderr
 		stdin, err := cmd.StdinPipe()

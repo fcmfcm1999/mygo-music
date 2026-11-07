@@ -95,6 +95,10 @@ func (a *app) setLanguage(code string) {
 	if lib := a.libOf(local.ID); lib != nil {
 		a.libraryChanged(lib)
 	}
+	// A plugin's pages are in the language it was asked in.
+	if lib := a.library; pluginOf(lib) != nil {
+		a.libraryChanged(lib)
+	}
 }
 
 // choice is a select of labels, to translate, reporting the index of the one
@@ -202,7 +206,10 @@ func (a *app) settingsView(c *ui.Context) {
 			if query != "" {
 				title = T("Search Results")
 			}
-			header := ui.Row(c.Key("header")).Absolute().Top(0).Left(0).Right(0).Height(topBar(c)).PaddingX(32).AlignItems(ui.Center).DragWindow()
+			// The + keeps clear of the window buttons where they sit at the
+			// right (Linux, Windows).
+			right := max(32, c.TitleBar().Right+12)
+			header := ui.Row(c.Key("header")).Absolute().Top(0).Left(0).Right(0).Height(topBar(c)).Padding(0, right, 0, 32).AlignItems(ui.Center).DragWindow()
 			header.Children(func() {
 				ui.Text(c, title).FontSize(15).FontWeight(700).SingleLine().Shrink(1).MinWidth(0)
 				if query == "" && current.id == "plugins" {
@@ -459,6 +466,11 @@ func (a *app) settingsSections(c *ui.Context, p palette) []settingsSection {
 				a.changed()
 			}
 		})
+		row(T("Grow From the Cover"), T("Now Playing opens out of the cover in the player bar and shrinks back into it, rather than sliding up from the bottom"), func() {
+			if ui.Switch(c.Key("grow-from-cover"), &s.GrowFromCover).Label(T("Grow From the Cover")).Changed() {
+				a.changed()
+			}
+		})
 	})
 
 	if a.updates {
@@ -575,16 +587,27 @@ func (a *app) pluginSettings(c *ui.Context, lib *library, p palette) {
 					name += " " + info.Version
 				}
 				ui.Text(c, name).FontSize(13.5).FontWeight(500)
-				// Where it came from, and who's signed in, on one line.
-				var about []string
-				if from := pluginFrom(lib); from != "" {
-					about = append(about, from)
-				}
+				// Where it came from, a link to its repository, and who's signed
+				// in, on one line.
+				from, url := pluginFrom(lib)
+				signedIn := ""
 				if enabled && !lib.needsSetup && lib.account != nil {
-					about = append(about, Tf("Signed in as %s", lib.account.Name))
+					signedIn = Tf("Signed in as %s", lib.account.Name)
 				}
-				if len(about) > 0 {
-					ui.Text(c, strings.Join(about, " · ")).FontSize(12).TextColor(p.muted).SingleLine()
+				if from != "" || signedIn != "" {
+					ui.Row(c).MinWidth(0).Children(func() {
+						if url != "" {
+							ui.Link(c, from, url).FontSize(12).TextColor(p.muted).SingleLine().Shrink(0).Tooltip(T("Open on GitHub"))
+						} else if from != "" {
+							ui.Text(c, from).FontSize(12).TextColor(p.muted).SingleLine().Shrink(0)
+						}
+						if signedIn != "" {
+							if from != "" {
+								signedIn = " · " + signedIn
+							}
+							ui.Text(c, signedIn).FontSize(12).TextColor(p.muted).SingleLine().Shrink(1).MinWidth(0)
+						}
+					})
 				}
 				if enabled && lib.needsSetup {
 					ui.Text(c, T("Fill these in for it to work")).FontSize(12).TextColor(p.accent).LineHeight(1.4)
@@ -658,7 +681,7 @@ func (a *app) pluginPermissions(c *ui.Context, lib *library, g guarded, p palett
 	granted := g.Granted()
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, programsWarning(perms.Process)).
-			FontSize(12).TextColor(p.accent).LineHeight(1.4).Grow(1).Shrink(1).MinWidth(0)
+			FontSize(12).TextColor(p.muted).LineHeight(1.4).Grow(1).Shrink(1).MinWidth(0)
 		label := T("Allow Programs")
 		if granted {
 			label = T("Stop Allowing")

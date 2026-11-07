@@ -2,6 +2,8 @@ package app
 
 import (
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -17,11 +19,14 @@ import (
 // browseData is what the app has of a page, kept as it loads anew.
 type browseData struct {
 	page    *music.Browse
+	at      time.Time // when page came
 	loading bool
 	err     string
 }
 
-// loadBrowse loads a page, unless it has, or again.
+// loadBrowse loads a page, unless it has, or again. One loaded longer than
+// listsFresh ago is asked for anew, as it may change as the app plays, such
+// as songs played lately, and shows as it was while it is.
 func (a *app) loadBrowse(lib *library, page string, again bool) {
 	if lib == nil {
 		return
@@ -31,7 +36,7 @@ func (a *app) loadBrowse(lib *library, page string, again bool) {
 		d = &browseData{}
 		lib.browses[page] = d
 	}
-	if d.loading || d.page != nil && !again {
+	if d.loading || d.page != nil && !again && time.Since(d.at) <= listsFresh {
 		return
 	}
 	d.loading, d.err = true, ""
@@ -43,7 +48,7 @@ func (a *app) loadBrowse(lib *library, page string, again bool) {
 				d.err = a.problem(lib, err, T("Couldn't load this page"))
 				return
 			}
-			d.page = b
+			d.page, d.at = b, time.Now()
 		})
 	}()
 }
@@ -60,10 +65,57 @@ func (a *app) browsePage(c *ui.Context) {
 		a.trackSkeleton(c, a.pageShimmer(c), true, func(c *ui.Context) {})
 		return
 	}
-	a.browseRows(c, d.page, id, func(c *ui.Context) {
-		if d.page.Title != "" {
-			a.heading(c, d.page.Title, d.page.Subtitle)
+	a.browseRows(c, d.page, id, func(c *ui.Context) { a.browseHeader(c, d.page) })
+}
+
+// browseHeader heads a page the source made up: its title, and what it says
+// of it, a line to each line. With a picture, it's of someone, and headed as
+// an artist's page is.
+func (a *app) browseHeader(c *ui.Context, page *music.Browse) {
+	p := a.pal
+	var lines []string
+	for line := range strings.SplitSeq(page.Description, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
 		}
+	}
+	about := func() {
+		for i, line := range lines {
+			t := ui.Text(c.Key(i), line).FontSize(13).TextColor(p.muted).MaxLines(2).LineHeight(1.45)
+			if i == 0 {
+				t.Margin(2, 0, 0, 0)
+			}
+		}
+	}
+	if page.ImageURL == "" {
+		if len(lines) == 0 {
+			if page.Title != "" {
+				a.heading(c, page.Title, page.Subtitle)
+			}
+			return
+		}
+		ui.Column(c).Gap(4).Margin(0, 0, 18, 0).Children(func() {
+			if page.Subtitle != "" {
+				ui.Text(c, page.Subtitle).FontSize(12).FontWeight(600).TextColor(p.muted).LetterSpacing(0.4)
+			}
+			ui.Text(c, page.Title).FontSize(30).FontWeight(700).LetterSpacing(-0.6)
+			about()
+		})
+		return
+	}
+	// As far below as an artist's sections are, as its first title keeps
+	// none of its own.
+	ui.Row(c).Gap(28).AlignItems(ui.End).Margin(0, 0, 34, 0).Children(func() {
+		ui.Box(c).Size(artistPhotoSize, artistPhotoSize).Radius(artistPhotoSize/2).Shadow(0, 18, 40, -10, p.cardShade).Children(func() {
+			a.coverFill(c, page.ImageURL, 600, artistPhotoSize/2)
+		})
+		ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
+			if page.Subtitle != "" {
+				ui.Text(c, page.Subtitle).FontSize(12).FontWeight(600).TextColor(p.accent)
+			}
+			ui.Text(c, page.Title).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
+			about()
+		})
 	})
 }
 
@@ -87,6 +139,7 @@ const (
 	rowShows
 	rowStations
 	rowLinks
+	rowEmpty
 )
 
 // browseLayout lays out page in rows. The first section of Home, if tracks, is
@@ -119,6 +172,9 @@ func browseLayout(page *music.Browse, pageID string, cols int) []browseRow {
 		cards(rowShows, s, len(sec.Shows))
 		cards(rowStations, s, len(sec.Stations))
 		cards(rowLinks, s, len(sec.Links))
+		if sec.Empty != "" && len(sec.Tracks)+len(sec.Albums)+len(sec.Artists)+len(sec.Playlists)+len(sec.Shows)+len(sec.Stations)+len(sec.Links) == 0 {
+			rows = append(rows, browseRow{rowEmpty, s, 0, 0})
+		}
 	}
 	return rows
 }
@@ -157,6 +213,8 @@ func (a *app) browseRows(c *ui.Context, page *music.Browse, pageID string, heade
 			a.browseTitle(c, sec, r.section == 0)
 		case rowTrack:
 			a.trackRow(c, sec.Tracks, r.from, true, "")
+		case rowEmpty:
+			ui.Column(c).Margin(0, 12, cardRowGap, 12).Children(func() { a.empty(c, sec.Empty) })
 		default:
 			a.cardRow(c, sec, r, cols)
 		}
@@ -228,7 +286,9 @@ func (a *app) sectionOf(r route) *music.Section {
 	return &page.Sections[at]
 }
 
-// sectionPage lists the tracks of a section the feature card shows only a few of.
+// sectionPage lists the tracks of a section the feature card shows only a few
+// of. It's headed as the card is: the day over the first cover's colors, and
+// the day's date over the title.
 func (a *app) sectionPage(c *ui.Context) {
 	sec := a.sectionOf(a.route)
 	if sec == nil {
@@ -236,16 +296,22 @@ func (a *app) sectionPage(c *ui.Context) {
 		return
 	}
 	p := a.pal
+	now := c.Now()
+	title := sec.PageTitle
+	if title == "" {
+		title = sec.Title
+	}
+	about := i18n.Songs(len(sec.Tracks))
+	if sec.Subtitle != "" {
+		about += " · " + sec.Subtitle
+	}
 	a.trackRows(c, sec.Tracks, true, func(c *ui.Context) {
 		ui.Row(c).Gap(28).AlignItems(ui.End).Padding(0, 0, 26, 0).Children(func() {
-			ui.Box(c).Size(212, 212).Radius(14).Shadow(0, 18, 40, -10, p.cardShade).Children(func() {
-				if len(sec.Tracks) > 0 {
-					a.coverFill(c, sec.Tracks[0].Album.ImageURL, 600, 14)
-				}
-			})
+			a.dayCover(c, sec.Tracks, now)
 			ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
-				ui.Text(c, sec.Title).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
-				ui.Text(c, i18n.Songs(len(sec.Tracks))).FontSize(13).TextColor(p.muted)
+				ui.Text(c, i18n.Today(now)).FontSize(12).FontWeight(600).LetterSpacing(0.3).TextColor(p.muted).MaxLines(1)
+				ui.Text(c, title).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
+				ui.Text(c, about).FontSize(13).TextColor(p.muted).MaxLines(2)
 				ui.Row(c).Gap(10).Margin(8, 0, 0, 0).Children(func() { a.playButtons(c, sec.Tracks) })
 			})
 		})

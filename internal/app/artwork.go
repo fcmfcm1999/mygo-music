@@ -8,9 +8,11 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"math"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"weak"
 
@@ -42,13 +44,25 @@ type artCache struct {
 	// gone are the covers dropped, for as long as something else holds
 	// them: Now Playing keeps the cover it shows, which comes back as it
 	// was rather than loading again.
-	gone  map[string]weak.Pointer[artwork]
-	busy  map[string]bool
-	sem   chan struct{}
-	post  func(func())
-	now   func() time.Time
-	size  int // the bytes the covers in art keep
-	limit int
+	gone map[string]weak.Pointer[artwork]
+	busy map[string]bool
+	// loads are the covers loading, by their key of sized, and sources the
+	// data they are of, by url: the sizes of a cover asked for at once
+	// fetch it once between them, and a backdrop decodes with the cover
+	// it is of. Each goes once the last that wants it has loaded, so it
+	// keeps no data or pixels past that.
+	loads   map[string]*artLoad
+	sources map[string]*artSource
+	sem     chan struct{}
+	pixels  *pixelBudget // of the covers decoding at once
+	post    func(func())
+	now     func() time.Time
+	size    int // the bytes the covers in art keep
+	limit   int
+	// decoded counts the pixels of the covers decoded since the heap
+	// last went back to the system, which tidy has it do once they stop.
+	decoded int
+	tidy    *time.Timer
 }
 
 // artLimit is how many bytes of covers the cache keeps. A cover keeps its
@@ -58,7 +72,7 @@ type artCache struct {
 const artLimit = 64 << 20
 
 func newArtCache(post func(func())) *artCache {
-	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, sem: make(chan struct{}, 8), post: post, now: time.Now, limit: artLimit}
+	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, loads: map[string]*artLoad{}, sources: map[string]*artSource{}, sem: make(chan struct{}, 8), pixels: newPixelBudget(decodePixels), post: post, now: time.Now, limit: artLimit}
 }
 
 // add keeps a cover, and drops those asked for least recently once the
@@ -115,25 +129,26 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 		return nil
 	}
 	c.busy[key] = true
+	l := c.hold(url)
 	go func() {
-		c.sem <- struct{}{}
-		bmp, img, size, err := loadArt(url)
-		<-c.sem
+		c.load(url, l)
 		var blurred *image.RGBA
-		var tint ui.Color
-		if err == nil {
-			tint = dominantColor(img)
-			if backdrop {
-				blurred = blurImage(img)
-			}
+		if l.err == nil && backdrop {
+			blurred = blurImage(l.img)
 		}
 		c.post(func() {
 			delete(c.busy, key)
-			if err != nil {
+			c.letGo(url, l)
+			c.decoded += l.pixels
+			l.pixels = 0
+			c.tidyUp()
+			if l.err != nil {
 				c.add(key, &artwork{failed: true, used: c.now()})
 				return
 			}
-			a := &artwork{bmp: bmp, tint: tint, used: c.now(), size: size}
+			// A backdrop shares the bitmap of the cover it is of, which
+			// each counts: the cache keeps either without the other.
+			a := &artwork{bmp: l.bmp, tint: l.tint, used: c.now(), size: l.size}
 			if blurred != nil {
 				a.backdrop = ui.NewBitmap(blurred)
 				a.size += len(blurred.Pix)
@@ -141,41 +156,217 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 			c.add(key, a)
 			// Shown by the frame post draws, the cover drops its pixels,
 			// which its data decodes again if they are needed.
-			time.AfterFunc(artRelease, func() { mygo.RunOnMain(bmp.ReleasePixels) })
+			time.AfterFunc(artRelease, func() { mygo.RunOnMain(l.bmp.ReleasePixels) })
 		})
 	}()
 	return nil
+}
+
+// artLoad is a cover loading at a size, for the cover and its backdrop.
+type artLoad struct {
+	once sync.Once
+	src  *artSource
+	bmp  *ui.Bitmap
+	img  image.Image
+	tint ui.Color
+	size int
+	err  error
+	n    int // those waiting for it, counted on the main thread
+	// pixels are those of the cover as it came, which decoding it took.
+	pixels int
+}
+
+// artSource is the data of a cover being fetched, for its sizes loading:
+// those its image server makes at the size asked fetch one each.
+type artSource struct {
+	url  string
+	once sync.Once
+	data []byte
+	err  error
+	n    int // the loads of it, counted on the main thread
+}
+
+// hold returns the load of the cover a key of sized names, the one
+// loading already if there is one, until letGo.
+func (c *artCache) hold(key string) *artLoad {
+	l := c.loads[key]
+	if l == nil {
+		url := fetchURL(key)
+		s := c.sources[url]
+		if s == nil {
+			s = &artSource{url: url}
+			c.sources[url] = s
+		}
+		s.n++
+		l = &artLoad{src: s}
+		c.loads[key] = l
+	}
+	l.n++
+	return l
+}
+
+// letGo lets go of a load that hold returned, and of its data once
+// nothing loading wants either.
+func (c *artCache) letGo(key string, l *artLoad) {
+	if l.n--; l.n > 0 {
+		return
+	}
+	if c.loads[key] == l {
+		delete(c.loads, key)
+	}
+	s := l.src
+	if s.n--; s.n == 0 && c.sources[s.url] == s {
+		delete(c.sources, s.url)
+	}
+}
+
+// load fetches and decodes the cover a key of sized names, on a goroutine,
+// unless another has: those after the first wait for it.
+func (c *artCache) load(key string, l *artLoad) {
+	l.once.Do(func() {
+		_, px := splitSized(key)
+		s := l.src
+		// A cover holds its place from its fetch to its decode, so that
+		// covers fetch no faster than they decode: those fetched waiting
+		// kept their data, megabytes each as sources give them.
+		c.sem <- struct{}{}
+		defer func() { <-c.sem }()
+		s.once.Do(func() { s.data, s.err = music.Fetch(s.url) })
+		if l.err = s.err; l.err != nil {
+			return
+		}
+		l.pixels = coverPixels(s.data)
+		took := c.pixels.take(l.pixels)
+		l.bmp, l.img, l.size, l.err = artOf(s.data, px)
+		c.pixels.give(took)
+		if l.err == nil {
+			l.tint = dominantColor(l.img)
+		}
+	})
+}
+
+// decodePixels is how many pixels of covers decode at once: a cover as a
+// source gives it can be 3000 pixels across, which decodes into some
+// 25 MB before it shrinks to a row's, and eight of those at once took
+// hundreds of megabytes. Small covers decode eight at a time as before;
+// covers that big, two or three.
+const decodePixels = 24 << 20
+
+// coverPixels returns how many pixels the cover of data has, or 0 if its
+// header doesn't say.
+func coverPixels(data []byte) int {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(stillCover(data)))
+	if err != nil {
+		return 0
+	}
+	return cfg.Width * cfg.Height
+}
+
+// tidyAfter is how long after the last cover of many decoded the heap
+// they took goes back to the system, and tidyPixels how many pixels of
+// covers that takes: Go keeps the memory a burst of decoding took for
+// minutes, which the system counts as the app's all that while.
+const (
+	tidyAfter  = 3 * time.Second
+	tidyPixels = 32 << 20
+)
+
+// tidyUp has the heap the covers decoded took go back to the system, once
+// enough decoded and none has for a while.
+func (c *artCache) tidyUp() {
+	if c.decoded < tidyPixels {
+		return
+	}
+	if c.tidy != nil {
+		c.tidy.Reset(tidyAfter)
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(tidyAfter, func() {
+		c.post(func() {
+			if c.tidy != t {
+				return
+			}
+			c.tidy = nil
+			// Those still loading tidy up once they have.
+			if len(c.loads) > 0 {
+				return
+			}
+			c.decoded = 0
+			go debug.FreeOSMemory()
+		})
+	})
+	c.tidy = t
+}
+
+// pixelBudget lets those that take pixels of it go on while they fit.
+type pixelBudget struct {
+	mu         sync.Mutex
+	cond       sync.Cond
+	free, size int
+}
+
+func newPixelBudget(size int) *pixelBudget {
+	b := &pixelBudget{free: size, size: size}
+	b.cond.L = &b.mu
+	return b
+}
+
+// take waits until n pixels are free, and takes them: all of them, for
+// more than there are. It returns how many it took, to give back.
+func (b *pixelBudget) take(n int) int {
+	n = min(n, b.size)
+	b.mu.Lock()
+	for b.free < n {
+		b.cond.Wait()
+	}
+	b.free -= n
+	b.mu.Unlock()
+	return n
+}
+
+func (b *pixelBudget) give(n int) {
+	b.mu.Lock()
+	b.free += n
+	b.mu.Unlock()
+	b.cond.Broadcast()
 }
 
 // artRelease is how long a cover keeps its pixels once loaded: past the
 // frame that first shows it, and the smaller copies it shows from there.
 const artRelease = 2 * time.Second
 
-// loadArt fetches the cover a key of sized names, as a bitmap to draw and an
+// artOf decodes the data of a cover to show at px, as a bitmap to draw and an
 // image to measure, with the bytes of its data. One much bigger than it shows
 // is kept smaller: a file's embedded cover can be thousands of pixels across.
-func loadArt(key string) (*ui.Bitmap, image.Image, int, error) {
-	url, px := splitSized(key)
-	b, err := music.Fetch(url)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	bmp, img, err := decodeArt(b)
+// Its bitmap is made only of the smaller copy, never of the cover as it came.
+func artOf(b []byte, px int) (*ui.Bitmap, image.Image, int, error) {
+	b = stillCover(b)
+	img, err := decodeImage(b)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	if size := img.Bounds().Size(); px > 0 && max(size.X, size.Y) > px*3/2 {
-		small, data, err := shrinkArt(img, px)
-		if err != nil {
-			return bmp, img, len(b), nil
+		if small, data, err := shrinkArt(img, px); err == nil {
+			bmp, err := ui.DecodeBitmap(data)
+			if err != nil {
+				return nil, nil, 0, err
+			}
+			return bmp, small, len(data), nil
 		}
-		bmp, err = ui.DecodeBitmap(data)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		return bmp, small, len(data), nil
+	}
+	bmp, err := ui.DecodeBitmap(b)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 	return bmp, img, len(b), nil
+}
+
+// fetchURL is the URL to fetch the cover a key of sized names from: one
+// the size it shows, from a source whose image server makes it so.
+func fetchURL(key string) string {
+	url, px := splitSized(key)
+	return music.SizedImage(url, px)
 }
 
 // splitSized takes a key of sized apart.
@@ -199,6 +390,7 @@ func shrinkArt(img image.Image, px int) (image.Image, []byte, error) {
 	if size.Y > size.X {
 		w, h = size.X*px/size.Y, px
 	}
+	img = halveTo(img, max(w, h))
 	small := image.NewRGBA(image.Rect(0, 0, max(w, 1), max(h, 1)))
 	draw.CatmullRom.Scale(small, small.Bounds(), img, img.Bounds(), draw.Over, nil)
 	var buf bytes.Buffer
@@ -208,16 +400,18 @@ func shrinkArt(img image.Image, px int) (image.Image, []byte, error) {
 	return small, buf.Bytes(), nil
 }
 
-// decodeArt decodes a cover twice: as a bitmap, which keeps the data to
-// decode its pixels again after it drops them, and as an image.
-func decodeArt(b []byte) (*ui.Bitmap, image.Image, error) {
-	b = stillCover(b)
-	img, _, err := image.Decode(bytes.NewReader(b))
-	if err != nil {
-		return nil, nil, err
+// halveTo halves img while it stays at least twice px on its longer side,
+// each pixel the mean of the four it covers: a scale that blends many
+// pixels into each, as one to a row's size from 3000 pixels does, takes
+// three times as long without.
+func halveTo(img image.Image, px int) image.Image {
+	size := img.Bounds().Size()
+	for max(size.X, size.Y) >= 4*px {
+		half := image.NewRGBA(image.Rect(0, 0, max(size.X/2, 1), max(size.Y/2, 1)))
+		draw.ApproxBiLinear.Scale(half, half.Bounds(), img, img.Bounds(), draw.Src, nil)
+		img, size = half, half.Bounds().Size()
 	}
-	bmp, err := ui.DecodeBitmap(b)
-	return bmp, img, err
+	return img
 }
 
 func fetchImage(url string) (image.Image, error) {

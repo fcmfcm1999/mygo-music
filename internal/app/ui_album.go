@@ -95,7 +95,7 @@ func (a *app) albumHeader(c *ui.Context, d *albumData) {
 			ui.Row(c).Gap(10).Margin(10, 0, 0, 0).Children(func() {
 				a.playButtons(c, tracks)
 				if a.can("saveAlbum") {
-					icon, label := iconPlus, T("Save")
+					icon, label := iconPlus, TC("Save", "library")
 					if al.Saved {
 						icon, label = iconCheck, T("Saved")
 					}

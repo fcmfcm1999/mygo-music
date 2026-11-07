@@ -531,7 +531,7 @@ func TestWalkFinds(t *testing.T) {
 	write(t, filepath.Join(dir, "lower.flac"), fixture(t, "seek.flac"))
 	write(t, filepath.Join(dir, ".hidden", "no.mp3"), audio)
 	write(t, filepath.Join(dir, "._lower.mp3"), audio)
-	write(t, filepath.Join(dir, "no.wav"), audio)
+	write(t, filepath.Join(dir, "no.wma"), audio)
 	write(t, filepath.Join(dir, "empty.mp3"), nil)
 	s := scanned(t, dir)
 	got := names(songs(t, s))
@@ -1284,5 +1284,129 @@ func TestScanFindsOgg(t *testing.T) {
 	}
 	if st.Type != "ogg" {
 		t.Errorf("type: %s", st.Type)
+	}
+}
+
+// Tags read in the wrong encoding come back as what was written: GBK and UTF-8
+// that the library took for Latin-1 or left as bytes, while real Latin-1 stays.
+func TestDecodeLegacy(t *testing.T) {
+	latin1 := func(b string) string {
+		r := make([]rune, len(b))
+		for i := range len(b) {
+			r[i] = rune(b[i])
+		}
+		return string(r)
+	}
+	for _, c := range []struct{ in, want string }{
+		{latin1("\xb4\xf8\xc0\xe1\xb5\xc4\xd3\xe3"), "带泪的鱼"},
+		{"\xd5\xd4\xc0\xd7", "赵雷"}, // ID3v1, as bytes
+		{latin1("\xe8\xb5\xb5\xe9\x9b\xb7"), "赵雷"},
+		{latin1("Mot\xf6rhead"), "Motörhead"},
+		{"Caf\xe9", "Café"},
+		{"Hebe 田馥甄", "Hebe 田馥甄"},
+	} {
+		if got := decodeLegacy(c.in); got != c.want {
+			t.Errorf("decodeLegacy(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// wavWith makes a second of 16-bit stereo WAV, with RIFF's INFO tags, as
+// field and value pairs.
+func wavWith(info ...[2]string) []byte {
+	le32 := func(b []byte, v int) []byte { return binary.LittleEndian.AppendUint32(b, uint32(v)) }
+	var list []byte
+	list = append(list, "INFO"...)
+	for _, f := range info {
+		v := f[1] + "\x00"
+		list = le32(append(list, f[0]...), len(v))
+		list = append(list, v...)
+		if len(v)%2 == 1 {
+			list = append(list, 0)
+		}
+	}
+	var b []byte
+	b = le32(append(b, "RIFF"...), 0)
+	b = append(b, "WAVE"...)
+	b = le32(append(b, "fmt "...), 16)
+	b = append(b, 1, 0, 2, 0)
+	b = le32(b, 44100)
+	b = le32(b, 44100*4)
+	b = append(b, 4, 0, 16, 0)
+	b = le32(append(b, "LIST"...), len(list))
+	b = append(b, list...)
+	b = le32(append(b, "data"...), 44100*4)
+	b = append(b, make([]byte, 44100*4)...)
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(b)-8))
+	return b
+}
+
+// WAV, ALAC and AAC files are found with their tags and lengths, and ALAC and
+// WAV play as lossless.
+func TestScanM4AAndWAV(t *testing.T) {
+	dir, data := t.TempDir(), t.TempDir()
+	write(t, filepath.Join(dir, "alac.m4a"), fixture(t, "seek.m4a"))
+	write(t, filepath.Join(dir, "aac.M4A"), fixture(t, "seek-aac.m4a"))
+	write(t, filepath.Join(dir, "Someone - Raw.aac"), fixture(t, "seek.aac"))
+	write(t, filepath.Join(dir, "w.wav"), wavWith([2]string{"INAM", "Waves"}, [2]string{"IART", "The Sea"}, [2]string{"IPRD", "Shore"}, [2]string{"ITRK", "4"}))
+	s := New(data)
+	s.AddFolders(dir)
+	wait(t, s)
+	if got := s.TrackCount(); got != 4 {
+		t.Fatalf("%d tracks: %v", got, names(songs(t, s)))
+	}
+
+	alac := songNamed(t, s, "Apple Lossless")
+	if alac.ArtistNames() != "The Encoders" || alac.Album.Name != "Containers" || alac.Album.Released != "2019" || alac.Duration != 2000 {
+		t.Errorf("alac track: %+v", alac)
+	}
+	if alac.Album.ImageURL == "" {
+		t.Error("alac track: no cover")
+	}
+	aac := songNamed(t, s, "Advanced Audio")
+	if aac.Duration != 3000 {
+		t.Errorf("aac track: %+v", aac)
+	}
+	raw := songNamed(t, s, "Raw")
+	if raw.ArtistNames() != "Someone" || raw.Duration < 3000 || raw.Duration > 3200 {
+		t.Errorf("adts track: %+v", raw)
+	}
+	wav := songNamed(t, s, "Waves")
+	if wav.ArtistNames() != "The Sea" || wav.Album.Name != "Shore" || wav.Duration != 1000 {
+		t.Errorf("wav track: %+v", wav)
+	}
+
+	for _, tt := range []struct {
+		tr           music.Track
+		typ, quality string
+	}{
+		{alac, "m4a", "lossless"},
+		{aac, "m4a", "high"},
+		{raw, "aac", "high"},
+		{wav, "wav", "lossless"},
+	} {
+		st, err := s.Stream(tt.tr.ID, "standard")
+		if err != nil || st.Type != tt.typ || st.Quality != tt.quality {
+			t.Errorf("%s: %+v, %v", tt.tr.Name, st, err)
+		}
+	}
+}
+
+// A WAV's tags in an ID3 chunk are read, before its INFO ones.
+func TestWAVWithID3(t *testing.T) {
+	dir := t.TempDir()
+	b := wavWith([2]string{"INAM", "From INFO"})
+	tag := id3([2]string{"TIT2", "From ID3"}, [2]string{"TPE1", "Tagger"})
+	chunk := binary.LittleEndian.AppendUint32([]byte("id3 "), uint32(len(tag)))
+	chunk = append(chunk, tag...)
+	if len(tag)%2 == 1 {
+		chunk = append(chunk, 0)
+	}
+	b = append(b, chunk...)
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(b)-8))
+	write(t, filepath.Join(dir, "w.wav"), b)
+	s := scanned(t, dir)
+	if tr := songNamed(t, s, "From ID3"); tr.ArtistNames() != "Tagger" || tr.Duration != 1000 {
+		t.Errorf("track: %+v", tr)
 	}
 }

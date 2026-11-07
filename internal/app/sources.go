@@ -13,6 +13,9 @@ import (
 // T returns text in the listener's language; see package i18n.
 func T(text string) string { return i18n.T(text) }
 
+// TC is T of a text that reads differently by what it's about.
+func TC(text, context string) string { return i18n.TC(text, context) }
+
 // Tf is T of a format, formatted.
 func Tf(format string, args ...any) string { return i18n.Tf(format, args...) }
 
@@ -64,12 +67,15 @@ type library struct {
 	askedSignIn, askedSetup bool
 
 	mine, saved []music.Playlist // the listener's playlists: made, and saved
+	mineAt      time.Time        // when they were last asked for
 	savingPl    map[string]bool  // the playlists whose saving or its end is on its way
 
 	liked      map[string]bool // the tracks known to be liked, or not
 	wantLikes  []string        // the tracks a heart showed for, to ask about
 	likedList  []music.Track   // the liked songs' page
 	likedPaged paged
+	likedAt    time.Time // when the liked songs' first page was asked for
+	likedFresh bool      // it's being asked for anew
 
 	recent      []music.Track
 	home        *music.Browse // the source's own Home
@@ -79,6 +85,8 @@ type library struct {
 
 	playlists map[string]*music.Playlist
 	loadingPl map[string]bool
+	plAt      map[string]time.Time // when each playlist loaded was asked for
+	freshPl   map[string]bool      // the loaded playlists being asked for anew
 	plErr     map[string]string
 	artists   map[string]*artistData
 	albums    map[string]*albumData
@@ -111,6 +119,8 @@ func newLibrary(src music.Source) *library {
 func (l *library) forget() {
 	l.playlists = map[string]*music.Playlist{}
 	l.loadingPl = map[string]bool{}
+	l.plAt = map[string]time.Time{}
+	l.freshPl = map[string]bool{}
 	l.plErr = map[string]string{}
 	l.artists = map[string]*artistData{}
 	l.albums = map[string]*albumData{}
@@ -118,7 +128,7 @@ func (l *library) forget() {
 	l.browses = map[string]*browseData{}
 	l.searches = map[route]*searchData{}
 	l.liked = nil
-	l.likedList, l.likedPaged = nil, paged{}
+	l.likedList, l.likedPaged, l.likedAt = nil, paged{}, time.Time{}
 	l.savedAlbums, l.savedAlbumsPaged = nil, paged{}
 	l.subscribed, l.subscribedOnce = nil, false
 	l.stations, l.stationsOnce = nil, false

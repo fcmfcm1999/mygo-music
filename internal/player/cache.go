@@ -16,7 +16,7 @@ import (
 
 // Cache keeps the songs played on disk, so that they play again at once,
 // and without the network: each named for its source, its ID at the source
-// and its quality, as <key>-<quality>.mp3, .flac or .ogg, with what its stream was
+// and its quality, as <key>-<quality>.<type>, with what its stream was
 // beside it in the same name's .json. Once they take more than the limit,
 // those played longest ago go first.
 type Cache struct {
@@ -49,7 +49,7 @@ func cacheKey(source, id, quality string) string {
 // keepable reports whether a song of quality and type ext may be kept: they
 // name its file, so only those known, which keep it in the cache's folder.
 func keepable(quality, ext string) bool {
-	return slices.Contains(music.Qualities, quality) && (ext == "mp3" || ext == "flac" || ext == "ogg")
+	return slices.Contains(music.Qualities, quality) && slices.Contains(songTypes, ext)
 }
 
 // lookup returns a song kept at quality or a better one, open to read, with
@@ -204,7 +204,7 @@ func (c *Cache) songs() []cachedSong {
 	var out []cachedSong
 	for _, e := range entries {
 		ext := filepath.Ext(e.Name())
-		if ext != ".mp3" && ext != ".flac" && ext != ".ogg" {
+		if ext == "" || !slices.Contains(songTypes, ext[1:]) {
 			continue
 		}
 		info, err := e.Info()

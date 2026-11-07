@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"mygo-music/internal/music"
@@ -14,7 +15,7 @@ import (
 // Song is a track's audio found for the listener to keep a copy of, in a file
 // of their own: kept in the cache, a file on disk, or at its source.
 type Song struct {
-	// Type is its file's: mp3, flac or ogg, as its source said.
+	// Type is its file's: one of songTypes, as its source said.
 	Type string
 	file *os.File      // kept in the cache, or on disk
 	st   *music.Stream // or else where it streams from
@@ -46,12 +47,14 @@ func (p *Player) FindSong(src music.Source, t music.Track, quality string) (*Son
 	return s, nil
 }
 
+// songTypes are the types of song the app knows, which name their files.
+var songTypes = []string{"mp3", "flac", "ogg", "wav", "m4a", "aac"}
+
 // songType is the type a stream says it is, to name its file by: one the app
 // knows, or else mp3, as the cache takes it. What a source sent may hold
 // anything.
 func songType(typ string) string {
-	switch typ = strings.ToLower(typ); typ {
-	case "mp3", "flac", "ogg":
+	if typ = strings.ToLower(typ); slices.Contains(songTypes, typ) {
 		return typ
 	}
 	return "mp3"
@@ -100,7 +103,7 @@ func (s *Song) copy(w io.Writer) error {
 	for k, v := range s.st.Headers {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := music.HeadersStay(http.DefaultClient, req.URL.Hostname(), s.st.Headers).Do(req)
 	if err != nil {
 		return err
 	}

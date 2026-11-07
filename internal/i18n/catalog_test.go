@@ -39,7 +39,7 @@ func goFiles(t *testing.T, visit func(path string, f *ast.File, fset *token.File
 }
 
 // keyOf returns the text of a call that marks text for translation, as T("...")
-// or i18n.Tf("...", n).
+// or i18n.Tf("...", n), and TC("...", "context") as the catalog has it.
 func keyOf(call *ast.CallExpr) (string, bool) {
 	var name string
 	switch fn := call.Fun.(type) {
@@ -53,10 +53,22 @@ func keyOf(call *ast.CallExpr) (string, bool) {
 	default:
 		return "", false
 	}
-	if name != "T" && name != "Tf" && name != "N" || len(call.Args) == 0 {
+	if name != "T" && name != "Tf" && name != "N" && name != "TC" || len(call.Args) == 0 {
 		return "", false
 	}
-	lit, ok := call.Args[0].(*ast.BasicLit)
+	text, ok := literal(call.Args[0])
+	if !ok || name != "TC" {
+		return text, ok
+	}
+	if len(call.Args) < 2 {
+		return "", false
+	}
+	context, ok := literal(call.Args[1])
+	return text + "|" + context, ok
+}
+
+func literal(e ast.Expr) (string, bool) {
+	lit, ok := e.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
 		return "", false
 	}
@@ -133,6 +145,23 @@ func TestSwitchingLanguage(t *testing.T) {
 	}
 	if got := T("no such text"); got != "no such text" {
 		t.Errorf("a text without a translation: %q", got)
+	}
+}
+
+// A text in a context has its own translation, and reads as itself in English:
+// keeping a playlist's new name isn't adding it to the library.
+func TestTextInContext(t *testing.T) {
+	defer SetLanguage(English)
+	SetLanguage(Chinese)
+	if got := T("Save"); got != "保存" {
+		t.Errorf("Save: %q", got)
+	}
+	if got := TC("Save", "library"); got != "收藏" {
+		t.Errorf("Save to the library: %q", got)
+	}
+	SetLanguage(English)
+	if got := TC("Save", "library"); got != "Save" {
+		t.Errorf("English: %q", got)
 	}
 }
 

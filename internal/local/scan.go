@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,14 +21,17 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/dhowden/tag"
+	"github.com/egoist/mygo/audio/mp4"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const (
 	// indexVersion changes when what's kept of a file does, for all of them to
 	// be read again.
-	indexVersion = 1
+	indexVersion = 2
 	// scanBatch is how many newly read files make a scan show what it has.
 	scanBatch = 300
 	// indexEvery is how often a long scan saves what it has, for quitting not to
@@ -239,7 +243,7 @@ func walk(ctx context.Context, folders []string) []found {
 				return nil
 			}
 			switch strings.ToLower(filepath.Ext(name)) {
-			case ".mp3", ".flac", ".ogg":
+			case ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac":
 			default:
 				return nil
 			}
@@ -318,7 +322,19 @@ func (s *Source) readFile(file found) (entry, bool) {
 	defer f.Close()
 
 	typ := fileType(f, file.path)
-	t := readTags(f, typ)
+	var track *mp4.Track
+	switch typ {
+	case "m4a":
+		var ok bool
+		if track, ok = m4aTrack(f, file.size); !ok {
+			return entry{}, false // HE-AAC, say, which the player doesn't decode
+		}
+	case "aac":
+		if !adtsPlayable(f) {
+			return entry{}, false
+		}
+	}
+	t := readTags(f, typ, file.size)
 	e := entry{
 		Path: file.path, Size: file.size, Mod: file.mod,
 		Title: t.title, Artist: t.artist, Album: t.album, AlbumArtist: t.albumArtist,
@@ -338,6 +354,12 @@ func (s *Source) readFile(file found) (entry, bool) {
 		e.Duration = flacDuration(f)
 	case "ogg":
 		e.Duration = oggDuration(f, file.size)
+	case "wav":
+		e.Duration = wavDuration(f, file.size)
+	case "m4a":
+		e.Duration = track.Duration.Milliseconds()
+	case "aac":
+		e.Duration = adtsDuration(f, file.size)
 	default:
 		e.Duration = mp3Duration(f, file.size)
 	}
@@ -374,21 +396,31 @@ type tags struct {
 // readTags reads a file's tags. The library panics on some malformed files, and
 // answers nothing if it can't make them out: either way, what's found so far
 // stands.
-func readTags(f *os.File, typ string) (t tags) {
+func readTags(f *os.File, typ string, size int64) (t tags) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("local: reading tags of %s: %v", f.Name(), r)
 		}
 	}()
+	var src io.ReadSeeker = f
 	// The library takes a FLAC behind an ID3 tag for an MP3.
 	start := int64(0)
-	if typ == "flac" {
+	switch typ {
+	case "flac":
 		start = id3v2Size(f)
+	case "wav":
+		// It reads no WAV: its tags are an ID3 tag in a chunk, or else
+		// RIFF's own.
+		id3 := wavID3(f, size)
+		if id3 == nil {
+			return wavInfo(f, size)
+		}
+		src = id3
 	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
+	if _, err := src.Seek(start, io.SeekStart); err != nil {
 		return t
 	}
-	m, err := tag.ReadFrom(f)
+	m, err := tag.ReadFrom(src)
 	if err != nil {
 		return t
 	}
@@ -405,12 +437,69 @@ func readTags(f *os.File, typ string) (t tags) {
 	if t.lyrics == "" {
 		t.lyrics, _ = raw["unsyncedlyrics"].(string)
 	}
+	t.lyrics = decodeLegacy(t.lyrics)
 	t.picture = m.Picture()
 	return t
 }
 
 func cleanTag(s string) string {
-	return strings.ToValidUTF8(strings.Trim(s, " \t\r\n\x00"), "")
+	return strings.Trim(decodeLegacy(s), " \t\r\n\x00")
+}
+
+// decodeLegacy undoes text the library read in the wrong encoding. ID3 has no
+// way to say GBK, so Chinese taggers wrote it where ISO-8859-1 belongs, and the
+// library hands it back a rune a byte; ID3v1 comes back as the bytes
+// themselves. Some taggers wrote UTF-8 there too. A byte that's ASCII after a
+// high one is taken for Latin-1, for "Motörhead" not to turn Chinese: GB2312,
+// which nearly every such tag keeps to, has both bytes high.
+func decodeLegacy(s string) string {
+	var b []byte
+	if utf8.ValidString(s) {
+		high := false
+		for _, r := range s {
+			if r > 0xff {
+				return s
+			}
+			high = high || r >= 0x80
+		}
+		if !high {
+			return s
+		}
+		b = make([]byte, 0, len(s))
+		for _, r := range s {
+			b = append(b, byte(r))
+		}
+	} else {
+		b = []byte(s)
+	}
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	if gbkPairs(b) {
+		if out, err := simplifiedchinese.GBK.NewDecoder().Bytes(b); err == nil && utf8.Valid(out) && !bytes.ContainsRune(out, utf8.RuneError) {
+			return string(out)
+		}
+	}
+	// Latin-1 after all.
+	r := make([]rune, len(b))
+	for i, c := range b {
+		r[i] = rune(c)
+	}
+	return string(r)
+}
+
+// gbkPairs tells whether every high byte of b is in a pair of two.
+func gbkPairs(b []byte) bool {
+	for i := 0; i < len(b); i++ {
+		if b[i] < 0x80 {
+			continue
+		}
+		if b[i] == 0x80 || b[i] == 0xff || i+1 == len(b) || b[i+1] < 0x80 || b[i+1] == 0xff {
+			return false
+		}
+		i++
+	}
+	return true
 }
 
 // yearOf is the year the library found, or else from a date it can't parse, of
@@ -503,24 +592,34 @@ func coverExt(pic *tag.Picture) string {
 	return ""
 }
 
-// fileType says whether a file is an mp3, a flac or an ogg: by what it holds if that
-// tells, and else by its name.
+// fileType says whether a file is an mp3, a flac, an ogg, a wav, an m4a or an
+// aac: by what it holds if that tells, and else by its name.
 func fileType(f io.ReaderAt, path string) string {
-	var head [4]byte
-	if _, err := f.ReadAt(head[:], id3v2Size(f)); err == nil && string(head[:]) == "fLaC" {
+	var head [12]byte
+	if _, err := f.ReadAt(head[:], 0); err == nil {
+		if string(head[4:8]) == "ftyp" {
+			return "m4a"
+		}
+		if (string(head[:4]) == "RIFF" || string(head[:4]) == "RF64") && string(head[8:12]) == "WAVE" {
+			return "wav"
+		}
+	}
+	clear(head[:])
+	if _, err := f.ReadAt(head[:4], id3v2Size(f)); err == nil && string(head[:4]) == "fLaC" {
 		return "flac"
 	}
-	if string(head[:]) == "OggS" {
+	if string(head[:4]) == "OggS" {
 		return "ogg"
 	}
-	if _, ok := parseFrameHeader(head[:]); ok {
+	if head[0] == 0xff && head[1]&0xf6 == 0xf0 {
+		return "aac" // ADTS: MP3's layer bits are never 0
+	}
+	if _, ok := parseFrameHeader(head[:4]); ok {
 		return "mp3"
 	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".flac":
-		return "flac"
-	case ".ogg":
-		return "ogg"
+	switch ext := strings.ToLower(filepath.Ext(path)); ext {
+	case ".flac", ".ogg", ".wav", ".m4a", ".aac":
+		return ext[1:]
 	}
 	return "mp3"
 }

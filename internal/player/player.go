@@ -735,7 +735,8 @@ func (p *Player) loadCover(gen int, t *music.Track) {
 		return
 	}
 	go func() {
-		cover, err := music.Fetch(url)
+		// The system shows it small, as Now Playing does.
+		cover, err := music.Fetch(music.SizedImage(url, 600))
 		if err == nil {
 			p.post(func() {
 				if gen == p.gen {

@@ -117,6 +117,35 @@ func (a *app) featureCard(c *ui.Context, sec *music.Section, pageID string, at i
 	}
 }
 
+// dayCover heads the page of the feature card's songs as the card is: the
+// first cover blurred through its colors, the day's number set large over
+// it.
+func (a *app) dayCover(c *ui.Context, songs []music.Track, now time.Time) {
+	var art *artwork
+	if len(songs) > 0 {
+		art = a.art.get(sized(songs[0].Album.ImageURL, 600), true)
+	}
+	box := ui.Box(c).Size(212, 212).Radius(14).Shadow(0, 18, 40, -10, a.pal.cardShade)
+	deep, rich, _ := dailyColors(art)
+	fade := ui.Animation{Duration: 600 * time.Millisecond}
+	deep, rich = box.AnimateColor("deep", deep, fade), box.AnimateColor("rich", rich, fade)
+	blurred := backdrop(art)
+	box.Draw(func(p *ui.Painter, r ui.Rect) {
+		p.Clip(r, 14, func() {
+			p.FillGradient(r, ui.LinearGradient{Angle: 135, Oklab: true, Stops: []ui.GradientStop{
+				{Color: deep, At: 0}, {Color: rich, At: 1},
+			}}, 0)
+			if blurred != nil {
+				p.ImageRegion(blurred, ui.Rect{W: 48, H: 48}, coverRect(r, 48, 48), ui.ImageOptions{Tint: white.Alpha(0.34)})
+			}
+		})
+		p.Stroke(r, white.Alpha(0.1), 14, 1)
+	})
+	box.Center().Children(func() {
+		ui.Text(c, fmt.Sprint(now.Day())).FontSize(112).FontWeight(800).LetterSpacing(-5).TextColor(white).LineHeight(1)
+	})
+}
+
 // The daily card's measures; the stack of covers is laid out by hand.
 const (
 	dailyHeight = 212

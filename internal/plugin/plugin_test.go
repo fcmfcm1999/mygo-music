@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
 )
 
@@ -374,6 +375,49 @@ export function suggest() { const t = host.storage.get("token"); return [t ? t.v
 	}
 }
 
+// The module's top level can use its storage and settings as it starts, as a
+// plugin reads its saved sign-in there.
+func TestTopLevelReadsStorage(t *testing.T) {
+	dir, data := write(t, `{"id":"x"}`, `
+const saved = host.storage.get("session");
+host.storage.set("seen", true);
+host.storage.remove("gone");
+const server = host.setting("server");
+export function home() { return { title: (saved ? saved.user : "none") + " " + (server || "-") }; }
+export function signOut() { host.storage.set("session", { user: "egoist" }); }`)
+	first, err := Load(dir, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.SignOut(); err != nil {
+		t.Fatal(err)
+	}
+	first.SetSetting("server", "nas.local")
+	first.Close()
+	p, err := Load(dir, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	done := make(chan string, 1)
+	go func() {
+		b, err := p.Home()
+		if err != nil {
+			done <- err.Error()
+			return
+		}
+		done <- b.Title
+	}()
+	select {
+	case got := <-done:
+		if got != "egoist nas.local" {
+			t.Fatalf("home: %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the plugin got stuck starting")
+	}
+}
+
 // A browser sign-in comes back with its query, and a plugin can only open pages.
 func TestSignInRedirect(t *testing.T) {
 	var opened string
@@ -578,5 +622,79 @@ export function signIn() {
 	}
 	if got.QR != "https://example.com/code" || got.Text != "Scan it" {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// A plugin that needs a newer app than this doesn't load, so it can't be
+// installed either; with no version of its own, as in development, it does.
+func TestMinAppVersion(t *testing.T) {
+	defer SetAppVersion(appVersion)
+	dir, data := write(t, `{"id":"x","name":"X","minAppVersion":"0.1.10"}`, `export function suggest() { return []; }`)
+	for _, c := range []struct {
+		app   string
+		loads bool
+	}{
+		{"0.1.9", false},
+		{"0.1.10", true},
+		{"0.2.0", true},
+		{"", true},
+		{"dev", true},
+	} {
+		SetAppVersion(c.app)
+		_, err := Load(dir, data)
+		var needs *NeedsNewerApp
+		if c.loads && err != nil || !c.loads && (!errors.As(err, &needs) || needs.Version != "0.1.10") {
+			t.Errorf("app %q: %v", c.app, err)
+		}
+	}
+	SetAppVersion("1.0.0")
+	bad, data := write(t, `{"id":"x","minAppVersion":"soon"}`, `export function suggest() { return []; }`)
+	if _, err := Load(bad, data); err == nil {
+		t.Error("loaded with a minAppVersion that isn't a version")
+	}
+}
+
+// A plugin's name, settings and sidebar, and what it translates with host.t,
+// follow the listener's language as it changes, without the plugin starting
+// over; what it didn't translate stays in English.
+func TestPluginLocales(t *testing.T) {
+	defer i18n.SetLanguage(i18n.Language())
+	dir, data := write(t, `{"id":"x","name":"Tube","settings":[{"key":"k","label":"Folder","help":"Where it is"}],
+"navigation":[{"title":"Charts","page":"charts"},{"title":"New","page":"new"}]}`, `
+export function suggest() { return [host.language(), host.t("Charts"), host.t("Nothing")]; }`)
+	os.MkdirAll(filepath.Join(dir, "locales"), 0o700)
+	os.WriteFile(filepath.Join(dir, "locales", "zh-CN.json"), []byte(`{"Tube":"管","Folder":"文件夹","Charts":"排行榜"}`), 0o600)
+	p, err := Load(dir, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	i18n.SetLanguage(i18n.English)
+	if got, err := p.Suggest(""); err != nil || strings.Join(got, ",") != "en,Charts,Nothing" {
+		t.Errorf("in English: %v, %v", got, err)
+	}
+	i18n.SetLanguage(i18n.Chinese)
+	info := p.Info()
+	if info.Name != "管" || info.Settings[0].Label != "文件夹" || info.Settings[0].Help != "Where it is" ||
+		info.Navigation[0].Title != "排行榜" || info.Navigation[1].Title != "New" {
+		t.Errorf("in Chinese: %+v", info)
+	}
+	if got, err := p.Suggest(""); err != nil || strings.Join(got, ",") != "zh-CN,排行榜,Nothing" {
+		t.Errorf("in Chinese: %v, %v", got, err)
+	}
+	i18n.SetLanguage(i18n.English)
+	if p.Info().Name != "Tube" || p.manifest.Navigation[0].Title != "Charts" {
+		t.Error("translating changed what plugin.json says")
+	}
+}
+
+// A locale that isn't JSON is the author's mistake to hear of, not English.
+func TestBadLocale(t *testing.T) {
+	dir, data := write(t, plain, `export function suggest() { return []; }`)
+	os.MkdirAll(filepath.Join(dir, "locales"), 0o700)
+	os.WriteFile(filepath.Join(dir, "locales", "zh-CN.json"), []byte(`{"a":`), 0o600)
+	if _, err := Load(dir, data); err == nil || !strings.Contains(err.Error(), "zh-CN.json") {
+		t.Errorf("got %v", err)
 	}
 }

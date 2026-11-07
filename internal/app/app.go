@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sync/atomic"
 
@@ -66,7 +67,10 @@ type app struct {
 	*library
 	local   *local.Source // the built-in source, nil in tests that have none
 	plugins []*plugin.Plugin
-	allLibs []*library // every plugin, on or off; libs are those on
+	headers *headerPlugins // the plugins on, for the headers of their pictures
+	allLibs []*library     // every plugin, on or off; libs are those on
+
+	wasBehind bool // the window wasn't at the front as last built
 
 	captions  captionState    // the episode playing's captions, and the model they take
 	installer pluginInstaller // installing and updating plugins
@@ -119,7 +123,7 @@ type app struct {
 	npShift     float32 // how far down it last showed, pulled
 	npPull      float32 // how far the pointer has pulled it down
 	npHeld      bool    // whether the pointer presses on it, to pull it
-	npStill     bool    // whether it comes and goes with a fade, for less motion
+	npStill     bool    // whether it comes and goes in place, sliding or fading, rather than out of the bar's cover
 	npFrom      ui.Rect // the player bar's cover, which it grows out of
 	npPane      int     // paneLyrics, paneQueue, paneStage, paneComments or paneShow
 	npPaneTop   float32 // how far the cover beside the pane starts below its top
@@ -226,8 +230,11 @@ func (a *app) makeSources() {
 	builtIn := newLibrary(a.local)
 	a.allLibs = []*library{builtIn}
 	plugin.SetOpenURL(mygo.Shell.OpenExternal)
+	plugin.SetAppVersion(mygo.App.Version())
 	plugin.SetWebSignIn(a.webSignIn)
 	a.plugins = plugin.Discover(pluginsDir(), userDataDir("plugin-data"))
+	a.headers = &headerPlugins{}
+	music.ImageHeaders = a.headers.image
 	for _, p := range a.plugins {
 		lib := newLibrary(p)
 		if !slices.ContainsFunc(a.allLibs, func(l *library) bool { return l.id == lib.id }) {
@@ -256,6 +263,15 @@ func (a *app) enabledChanged() {
 	}
 	if len(a.libs) == 0 && len(a.allLibs) > 0 {
 		a.libs = a.allLibs[:1]
+	}
+	if a.headers != nil {
+		var on []*plugin.Plugin
+		for _, lib := range a.libs {
+			if p := pluginOf(lib); p != nil {
+				on = append(on, p)
+			}
+		}
+		a.headers.set(on)
 	}
 }
 
@@ -376,6 +392,10 @@ func Run() error {
 		a.syncDock()
 		a.win.OnShow(a.syncDock)
 		a.win.OnHide(a.syncDock)
+		// Hidden, it draws nothing for a while: what the heap took for
+		// the pages it showed goes back to the system, which Go would
+		// keep for minutes.
+		a.win.OnHide(func() { go debug.FreeOSMemory() })
 		// Shown or switched to a while after, it shows what's new.
 		a.win.OnFocus(a.freshenHome)
 		a.applyTray()
